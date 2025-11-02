@@ -398,7 +398,7 @@ def main():
 
 
 if __name__ == "__main__":
-    print("#### Started on %s ####\n" % time.asctime())
+    print("Started on %s \n" % time.asctime())
     START = timeit.default_timer()
     try:
         main()
@@ -410,4 +410,4 @@ if __name__ == "__main__":
             print(line, file=sys.stderr, end="")
         raise
     STOP = timeit.default_timer()
-    print(f"\n Done on {time.asctime()}.\nTotal runtime ≈ {STOP - START:.3f} s ####")
+    print(f"\n Done on {time.asctime()}.\nTotal runtime ≈ {STOP - START:.3f} s")
