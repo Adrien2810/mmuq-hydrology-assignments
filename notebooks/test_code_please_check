@@ -266,7 +266,7 @@ def main():
     eval_idx = 0
     start_time = time.time()
 
-    def logged_ofv(x):
+    def recorded_ofv(x):
         nonlocal eval_idx
         ofv, metrics, _ = objective_function(x, tems, ppts, pets, tsps, dslr, diso)
         eval_params.append(np.array(x, float))
@@ -306,7 +306,7 @@ def main():
         return False  
 
     res = differential_evolution(
-        logged_ofv,
+        recorded_ofv,
         bounds=BOUNDS,
         strategy="best1bin",
         maxiter=20000,                 # high cap; budget guard stops earlier
