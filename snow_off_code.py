@@ -254,7 +254,13 @@ def turn_off_snow(p):
 def turn_off_lower_reservoir(p):
     q = np.array(p, float)
     q[9]=0.0; q[16]=0.0; q[17]=0.0
-    return q """
+    return q 
+
+#turn off soil 
+def turn_off_soil(p):
+    q = np.array(p,float)
+    q[7]=0.0; q[4]=0.000001; q[6]=0.000001; q[5]=1000000
+    return q"""
 
 def main():
     
@@ -455,10 +461,17 @@ def main():
     plot_internal_vars(df.index, df, otps_nu, labels,
                        "Internal Variables — Upper Reservoir OFF", "internal_urr_off.png")
 
+    p_no_soil = turn_off_soil(best_params)
+    otps_no, sim_no, _, met_no = run_with_params(p_no_soil, m0, diso)
+    print(f"URR OFF | NSE = {met_no['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_no, labels,
+                       "Internal Variables — Soil OFF", "internal_soil_off.png")
+
     plot_obs_sim(df.index, diso, sim_on, "Hydrograph — All ON (optimized)", "hydro_all_on.png")
     plot_obs_sim(df.index, diso, sim_ns, "Hydrograph — Snow OFF", "hydro_snow_off.png")
     plot_obs_sim(df.index, diso, sim_nl, "Hydrograph — LRR OFF", "hydro_lrr_off.png")
     plot_obs_sim(df.index, diso, sim_nu, "Hydrograph — URR OFF", "hydro_urr_off.png")
+    plot_obs_sim(df.index, diso, sim_no, "Hydrograph — Soil OFF", "soil_off.png")
  """
     print("\n All outputs saved in:", os.getcwd())
 
