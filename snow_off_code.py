@@ -245,16 +245,56 @@ def turn_off_snow(p):
     q = np.array(p, float)
     q[0]=0.0; q[1]=0.0; q[2]=0.0; q[3]=0.0
     return q
-
-""" def turn_off_upper_reservoir(p):
-    q = np.array(p, float)
-    q[8]=0.0; q[10]=0.0; q[11]=0.0; q[12]=0.0; q[13]=1.0; q[14]=0.0; q[15]=0.0
+    
+#Turn off upper reservoir module
+def turn_urr_off(params):
+    """
+    URR OFF — true bypass:
+      - No inflow to URR: WSR=1 (100% bypass) and ensure split is used (UCT=1)
+      - No outflows: TDR=0, NDR=0, ULC=0 (no percolation)
+      - High TDH (belt & suspenders) and zero storage.
+    """
+    q = np.array(params, float)
+    q[15] = 1.0  # URR_UCT: enable split logic so WSR is honored
+    q[10] = 1.0  # URR_WSR: 100% bypass → (1-WSR)=0 → no inflow
+    q[11] = 0.0  # URR_ULC: no percolation to LRR
+    q[13] = 0.0  # URR_TDR: QT=0
+    q[14] = 0.0  # URR_NDR: QN=0
+    q[12] = 1e3  # URR_TDH: very high
+    q[8]  = 0.0  # URR_DTH
     return q
 
-def turn_off_lower_reservoir(p):
+
+def set_urr_percolation_only(p):
+    """
+    URR percolation-only:
+      - All water enters URR (WSR=0, UCT=1),
+      - QT≈0 and QN=0 (TDR=0, NDR=0, TDH high),
+      - PLN>0 (ULC=1).
+    """
     q = np.array(p, float)
-    q[9]=0.0; q[16]=0.0; q[17]=0.0
-    return q 
+    q[15] = 1.0  # URR_UCT: use split logic
+    q[10] = 0.0  # URR_WSR: 0 → all RNF to URR (no bypass)
+    q[13] = 0.0  # URR_TDR: QT=0
+    q[14] = 0.0  # URR_NDR: QN=0
+    q[12] = 1e3  # URR_TDH: very high to suppress any thresholded outflow
+    q[11] = 1.0  # URR_ULC: enable percolation to LRR
+    return q
+
+# Turn off lower reservoir module:
+def turn_off_lower_reservoir(p):
+    """
+    LRR OFF:
+      - No percolation inflow (ULC=0),
+      - No baseflow out (DRE=0),
+      - Zero storage and zero loss coefficient.
+    """
+    q = np.array(p, float)
+    q[11] = 0.0  # URR_ULC: cut PLN into LRR
+    q[16] = 0.0  # LRR_DRE: no baseflow
+    q[9]  = 0.0  # LRR_DTH
+    q[17] = 0.0  # LRR_LCT
+    return q
 
 #turn off soil 
 def turn_off_soil(p):
@@ -449,17 +489,28 @@ def main():
     plot_internal_vars(df.index, df, otps_ns, labels,
                        "Internal Variables — Snow OFF", "internal_snow_off.png")
 
-    p_no_lrr = turn_off_lower_reservoir(best_params)
-    otps_nl, sim_nl, _, met_nl = run_with_params(p_no_lrr, m0, diso)
-    print(f"LRR OFF | NSE = {met_nl['NSE']:.3f}")
+    # LRR OFF
+    p_no_lrr = turn_off_lower_reservoir(save_params)
+    otps_nl, sim_nl, _, met_nl = run_with_params(p_no_lrr, tems, ppts, pets, tsps, dslr, diso)
+    print(f"LRR OFF          | NSE = {met_nl['NSE']:.3f}")
     plot_internal_vars(df.index, df, otps_nl, labels,
                        "Internal Variables — Lower Reservoir OFF", "internal_lrr_off.png")
 
-    p_no_urr = turn_off_upper_reservoir(best_params)
-    otps_nu, sim_nu, _, met_nu = run_with_params(p_no_urr, m0, diso)
-    print(f"URR OFF | NSE = {met_nu['NSE']:.3f}")
-    plot_internal_vars(df.index, df, otps_nu, labels,
-                       "Internal Variables — Upper Reservoir OFF", "internal_urr_off.png")
+    # URR OFF (true bypass)
+    p_urr_off = turn_urr_off(save_params)
+    otps_uoff, sim_uoff, labels_uoff, met_uoff = run_with_params(p_urr_off, tems, ppts, pets, tsps, dslr, diso)
+    print(f"URR OFF (bypass) | NSE = {met_uoff['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_uoff, labels_uoff,
+                       "Internal Variables — URR OFF (Bypass, QT=QN=PLN≈0)", "internal_urr_off_bypass.png")
+
+    # URR percolation-only
+    p_urr_perc = set_urr_percolation_only(save_params)
+    otps_upc, sim_upc, labels_upc, met_upc = run_with_params(p_urr_perc, tems, ppts, pets, tsps, dslr, diso)
+    print(f"URR Percolation-only | NSE = {met_upc['NSE']:.3f}")
+    plot_internal_vars(df.index, df, otps_upc, labels_upc,
+                       "Internal Variables — URR Percolation Only (QT≈0, QN=0, PLN>0)",
+                       "internal_urr_percolation_only.png")
+
 
     p_no_soil = turn_off_soil(best_params)
     otps_no, sim_no, _, met_no = run_with_params(p_no_soil, m0, diso)
