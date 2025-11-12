@@ -1,0 +1,550 @@
+
+
+import os
+import sys
+import time
+from argparse import ArgumentParser
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+from scipy.optimize import differential_evolution
+
+import importlib, pkgutil
+HBV001A = None
+_last_err = None
+
+for dotted in [
+    "hmg",
+    "hmg.hbv",
+    "hmg.models",
+    "hmg.models.hbv001a",
+    "hmg.hbv001a",
+]:
+    try:
+        mod = importlib.import_module(dotted)
+        if hasattr(mod, "HBV001A"):
+            HBV001A = getattr(mod, "HBV001A")
+            break
+    except Exception as e:
+        _last_err = e
+
+if HBV001A is None:
+    try:
+        import hmg
+        for info in pkgutil.walk_packages(hmg.__path__, hmg.__name__ + "."):
+            try:
+                m = importlib.import_module(info.name)
+                if hasattr(m, "HBV001A"):
+                    HBV001A = getattr(m, "HBV001A")
+                    break
+            except Exception:
+                pass
+    except Exception as e:
+        _last_err = e
+
+if HBV001A is None:
+    raise ImportError(
+        "Could not locate HBV001A inside 'hmg'. Activate the env that has hmg installed.\n"
+        f"Last import error: {_last_err}"
+    )
+
+
+# Parameter names (model order)
+
+PARAM_NAMES = [
+    "snw_dth","snw_att","snw_pmf","snw_amf",
+    "sl0_dth","sl0_pwp","sl0_fcy","sl0_bt0",
+    "urr_dth","lrr_dth",
+    "urr_wsr","urr_ulc","urr_tdh","urr_tdr","urr_ndr","urr_uct",
+    "lrr_dre","lrr_lct"
+]
+
+# Baseline bounds (ALL ON) — wide, physical ranges.
+BASE_BOUNDS = [
+    (0.00, 0.00),   # snw_dth fixed (state placeholder; not really optimized)
+    (-2.0, 3.0),    # snw_att (TT)
+    (0.00, 3.00),   # snw_pmf
+    (0.00, 10.0),   # snw_amf
+
+    (0.00, 100.0),  # sl0_dth
+    (5.00, 700.0),  # sl0_pwp
+    (100.0, 700.0), # sl0_fcy
+    (0.01, 10.0),   # sl0_bt0
+
+    (0.00, 20.0),   # urr_dth
+    (0.00, 100.0),  # lrr_dth
+
+    (0.00, 1.00),   # urr_wsr
+    (0.00, 1.00),   # urr_ulc
+    (0.00, 200.0),  # urr_tdh
+    (0.01, 1.00),   # urr_tdr
+    (0.00, 1.00),   # urr_ndr
+    (0.00, 1.00),   # urr_uct
+
+    (0.00, 1.00),   # lrr_dre
+    (0.00, 1.00),   # lrr_lct
+]
+
+
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True); return p
+
+def resolve_data_dir(user_arg: str | None) -> Path:
+    """
+    We expect folder containing:
+      - time_series___24163005.csv
+      - area___24163005.csv
+    """
+    if user_arg:
+        p = Path(user_arg).expanduser().resolve()
+        if (p / "time_series___24163005.csv").exists() and (p / "area___24163005.csv").exists():
+            return p
+        raise FileNotFoundError(f"--data '{p}' does not contain the required CSVs.")
+    cwd = Path.cwd()
+    if (cwd / "time_series___24163005.csv").exists() and (cwd / "area___24163005.csv").exists():
+        return cwd
+    dl = Path.home() / "Downloads" / "24163005"
+    if (dl / "time_series___24163005.csv").exists() and (dl / "area___24163005.csv").exists():
+        return dl.resolve()
+    raise FileNotFoundError("Pass --data '/Users/nafisaraihana/Downloads/24163005' (folder with the two CSVs).")
+
+def calc_nse(obs: np.ndarray, sim: np.ndarray) -> float:
+    obs = np.asarray(obs, float)
+    sim = np.asarray(sim, float)
+    mask = np.isfinite(obs) & np.isfinite(sim)
+    obs = obs[mask]; sim = sim[mask]
+    denom = np.sum((obs - obs.mean()) ** 2)
+    if denom <= 0:
+        return float("-inf")
+    return 1.0 - np.sum((obs - sim) ** 2) / denom
+
+def build_model(tems, ppts, pets, tsps, dslr) -> HBV001A:
+    m = HBV001A()
+    m.set_inputs(tems, ppts, pets)
+    m.set_outputs(tsps)
+    m.set_discharge_scaler(dslr)
+    m.set_optimization_flag(0)
+    return m
+
+# Plot helpers 
+def plot_obs_sim(index, obs, sim, title, out_png):
+    fig = plt.figure(figsize=(7.2, 3.4), dpi=140)
+    plt.plot(index, obs, label="OBS", alpha=0.9)
+    plt.plot(index, sim, label="SIM", alpha=0.9)
+    plt.grid(True, ls=":")
+    plt.legend()
+    plt.xticks(rotation=30)
+    plt.xlabel("Time [hr]"); plt.ylabel("Discharge [m³/s]")
+    plt.title(title)
+    plt.tight_layout(); plt.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_convergence(best_list, out_png):
+    if not best_list: return
+    fig, ax = plt.subplots(figsize=(6.4, 3.2), dpi=140)
+    ax.plot(best_list, lw=2)
+    ax.set_xlabel("Generation"); ax.set_ylabel("Objective (1 - NSE)")
+    ax.set_title("DE Convergence")
+    ax.grid(True, ls=":")
+    fig.tight_layout(); fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_param_paths(best_params_full_by_gen, out_dir, prefix="param_path_"):
+    if not best_params_full_by_gen: return
+    arr = np.vstack(best_params_full_by_gen); gens = np.arange(arr.shape[0])
+    for j, name in enumerate(PARAM_NAMES):
+        fig = plt.figure(figsize=(6.0, 3.6), dpi=140)
+        plt.step(gens, arr[:, j], where="post")
+        plt.grid(True, ls=":")
+        plt.xlabel("Generation"); plt.ylabel(name)
+        plt.title(f"{name} vs Generation")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"{prefix}{name.lower()}.png", dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+def plot_param_scatter_by_generation(df_eval: pd.DataFrame,
+                                     bounds_full: list,
+                                     out_dir: Path,
+                                     y_min: float = 1e-2,
+                                     y_max: float = 1e2,
+                                     cmap: str = "plasma",
+                                     point_size: int = 12,
+                                     alpha: float = 0.75):
+    ensure_dir(out_dir)
+    df = df_eval[np.isfinite(df_eval["ofv"])].copy()
+    if df.empty:
+        return
+    if "generation" not in df.columns:
+        df["generation"] = np.arange(len(df))
+    gmin, gmax = int(df["generation"].min()), int(df["generation"].max())
+    norm = Normalize(vmin=gmin, vmax=gmax)
+    for (name, (lo, hi)) in zip(PARAM_NAMES, bounds_full):
+        if name not in df.columns: continue
+        x = df[name].to_numpy(float); y = df["ofv"].to_numpy(float); gen = df["generation"].to_numpy(int)
+        keep = np.isfinite(x) & (x >= lo) & (x <= hi)
+        x = x[keep]; y = y[keep]; gen = gen[keep]
+        if x.size == 0: continue
+        jitter = (np.random.rand(x.size) - 0.5) * (hi - lo) * 1e-3
+        xj = x + jitter
+        fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=140)
+        ax.scatter(xj, y, c=gen, cmap=cmap, norm=norm, s=point_size, alpha=alpha, linewidths=0)
+        ax.set_yscale("log"); ax.set_xlim(lo, hi); ax.set_ylim(y_min, y_max)
+        ax.set_xlabel(f"{name} [-]"); ax.set_ylabel("(1 - NSE) [-]")
+        ax.set_title(f"Sensitivity: {name}  (Bounds: [{lo:g}, {hi:g}])")
+        ax.grid(True, which="both", ls=":", alpha=0.7)
+        cbar = plt.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, pad=0.01)
+        cbar.set_label("Generation")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"ofv_vs_{name.lower()}__scatter.png", dpi=220, bbox_inches="tight")
+        plt.close(fig)
+
+# Scenario specification  
+def scenario_fixed_and_bounds(name: str):
+    """
+    Returns:
+      fixed: dict(name->value) for parameters to hold constant
+      bounds_active: list of (lo,hi) for only the FREE parameters (in active order)
+      active_indices: list of indices into PARAM_NAMES corresponding to bounds_active
+    """
+    fixed = {}
+    b_full = list(BASE_BOUNDS)
+
+    if name == "snow_off":
+        fixed.update({
+            "snw_att": -100.0,
+            "snw_pmf": 0.0,
+            "snw_amf": 0.0,
+        })
+
+    elif name == "soil_off":
+        fixed.update({
+            "sl0_dth": 0.0,
+            "sl0_pwp": 700.0,
+            "sl0_fcy": 100.0,
+            "sl0_bt0": 0.01,
+        })
+
+    elif name == "urr_to_river":
+        # URR -> river (QT path). No bypass, no percolation, no QN.
+        fixed.update({
+            "urr_dth": 0.0,
+            "urr_wsr": 0.0,
+            "urr_tdh": 0.0,
+            "urr_tdr": 1.0,
+            "urr_ndr": 0.0,
+            "urr_ulc": 0.0,
+            "urr_uct": 0.0,
+        })
+
+    elif name == "urr_to_lrr":
+        # Only percolation to LRR (no QT, no QN).
+        fixed.update({
+            "urr_dth": 0.0,
+            "urr_wsr": 0.0,
+            "urr_tdr": 0.0,
+            "urr_ndr": 0.0,
+            "urr_tdh": 200.0,
+            "urr_ulc": 1.0,
+            "urr_uct": 0.0,
+        })
+
+    elif name == "lrr_off_qt":
+        # LRR off completely; quick path active.
+        fixed.update({
+            "lrr_dth": 0.0,
+            "lrr_dre": 0.0,
+            "lrr_lct": 0.0,
+            "urr_ulc": 0.0,
+            "urr_wsr": 0.0,
+            "urr_tdh": 0.0,
+            "urr_tdr": 1.0,
+            "urr_ndr": 0.0,
+        })
+
+    elif name == "all_on":
+        pass
+    else:
+        raise ValueError(f"Unknown scenario: {name}")
+
+    # Build active parameter index list and active bounds list
+    active_indices, bounds_active = [], []
+    for i, name_i in enumerate(PARAM_NAMES):
+        if name_i in fixed:
+            continue
+        lo, hi = b_full[i]
+        # If baseline bound is degenerate (e.g., snw_dth 0..0), skip from optimization
+        if hi > lo:
+            active_indices.append(i)
+            bounds_active.append((lo, hi))
+        else:
+            # treat as fixed at lo
+            fixed[name_i] = lo
+
+    return fixed, bounds_active, active_indices, b_full
+
+# Objective over ACTIVE parameters 
+def objective_function(active_params, model, diso, fixed_map, active_indices, bounds_full):
+    # 1) start from midpoints of the full bounds (optional)
+    p_full = np.array([0.5*(lo+hi) for (lo,hi) in bounds_full], dtype=float)
+
+    # 2) inject fixed values explicitly (do NOT rely on zero-width bounds)
+    for name, val in fixed_map.items():
+        p_full[PARAM_NAMES.index(name)] = float(val)
+
+    # 3) write active values and clip to full bounds (safety)
+    for k, idx in enumerate(active_indices):
+        lo, hi = bounds_full[idx]
+        p_full[idx] = np.clip(active_params[k], lo, hi)
+
+    # 4) run model, compute OFV
+    try:
+        model.set_parameters(p_full)
+    except AssertionError:
+        return 1e6, {"NSE": float("-inf")}, None, p_full
+    model.run_model()
+    sim = model.get_discharge()
+    nse = calc_nse(diso, sim)
+
+    NSE_FLOOR = -1.0
+    if not np.isfinite(nse):
+        return 1e6, {"NSE": float("-inf")}, None, p_full
+    ofv = max(0.0, 1.0 - max(nse, NSE_FLOOR))  # never negative, floored
+
+    return ofv, {"NSE": float(nse)}, sim, p_full 
+
+
+# Internal variables plot 
+def plot_internal_vars(index, df, otps, labels_map, title, out_png):
+    def get_idx(k):  # labels_map is dict name->index
+        return labels_map.get(k, None)
+
+    fig, axs = plt.subplots(8, 1, figsize=(7.0, 9.5), dpi=140, sharex=True)
+    (axs_tem, axs_ppt, axs_snw, axs_sl0, axs_etn, axs_rrr, axs_rnf, axs_bal) = axs
+
+    axs_tem.plot(df["tavg__ref"], alpha=0.9); axs_tem.set_ylabel("TEM\n[°C]")
+    axs_ppt.plot(df["pptn__ref"], alpha=0.9); axs_ppt.set_ylabel("PPT\n[mm]")
+
+    i = get_idx("snw_dth");  axs_snw.plot(index, otps[:, i], alpha=0.9) if i is not None else None
+    axs_snw.set_ylabel("SNW\n[mm]")
+
+    i = get_idx("sl0_dth");  axs_sl0.plot(index, otps[:, i], alpha=0.9) if i is not None else None
+    axs_sl0.set_ylabel("SL0\n[mm]")
+
+    i_etn = get_idx("sl0_etn")
+    if i_etn is not None:
+        axs_etn.plot(index, df["petn__ref"], label="PET", alpha=0.9)
+        axs_etn.plot(index, otps[:, i_etn], label="ETN", alpha=0.9)
+        axs_etn.legend()
+    axs_etn.set_ylabel("ETN\n[mm]")
+
+    iu = get_idx("urr_dth"); il = get_idx("lrr_dth")
+    if iu is not None: axs_rrr.plot(index, otps[:, iu], label="URR", alpha=0.9)
+    if il is not None: axs_rrr.plot(index, otps[:, il], label="LRR", alpha=0.9)
+    if iu is not None or il is not None: axs_rrr.legend()
+    axs_rrr.set_ylabel("DTH\n[mm]")
+
+    isfc = get_idx("chn_pow"); iug = get_idx("urr_urf"); ilg = get_idx("lrr_lrf")
+    if isfc is not None: axs_rnf.plot(index, otps[:, isfc], label="SFC", alpha=0.9)
+    if iug is not None and ilg is not None:
+        axs_rnf.plot(index, otps[:, iug] + otps[:, ilg], label="GND", alpha=0.9)
+    if isfc is not None or (iug is not None and ilg is not None): axs_rnf.legend()
+    axs_rnf.set_ylabel("RNF\n[mm]")
+
+    i = get_idx("mod_bal"); axs_bal.plot(index, otps[:, i], alpha=0.9) if i is not None else None
+    axs_bal.set_ylabel("BAL\n[mm]")
+
+    for ax in axs: ax.grid(True, ls=":")
+    axs[-1].set_xlabel("Time [hr]")
+    plt.xticks(rotation=30)
+    plt.suptitle(title)
+    plt.tight_layout(); plt.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+#  One scenario run 
+def run_scenario(scenario, tems, ppts, pets, tsps, dslr, diso, df, out_root,
+                 maxiter, popsize, seed, max_minutes, max_evals):
+
+    fixed_map, bounds_active, active_indices, bounds_full = scenario_fixed_and_bounds(scenario)
+
+    scen_dir  = ensure_dir(out_root / scenario)
+    figs_dir  = ensure_dir(scen_dir / "figs")
+    paths_dir = ensure_dir(scen_dir / "paths")
+    scat_dir  = ensure_dir(scen_dir / "scatters")
+
+    # Initial full guess (legal-ish)
+    prms0_full = np.array([
+        0.00, 0.10, 0.01, 0.10,
+        20.0, 200., 300., 2.50,
+        5.00, 10.0,
+        0.10, 0.10, 30., 0.10, 0.10, 0.01,
+        1e-2, 1e-3
+    ], dtype=float)
+
+    # Apply fixed values to initial full guess
+    for nm, val in fixed_map.items():
+        prms0_full[PARAM_NAMES.index(nm)] = float(val)
+    # Clip to baseline bounds
+    for i,(lo,hi) in enumerate(bounds_full):
+        prms0_full[i] = np.clip(prms0_full[i], lo, hi)
+
+    # Build initial ACTIVE vector by extracting from full
+    prms0_active = np.array([prms0_full[i] for i in active_indices], float)
+    for k, idx in enumerate(active_indices):
+        lo, hi = bounds_full[idx]
+        prms0_active[k] = np.clip(prms0_active[k], lo, hi)
+
+    # Model and initial simulation
+    m0 = build_model(tems, ppts, pets, tsps, dslr)
+    m0.set_parameters(prms0_full); m0.run_model()
+    sim0 = m0.get_discharge()
+    plot_obs_sim(df.index, diso, sim0, f"Observed vs Simulated (Initial) — {scenario}", figs_dir / "initial_run.png")
+
+    # Logs
+    eval_log = []
+    best_by_gen = []
+    best_params_full_by_gen = []
+    best_nse_by_gen = []
+
+    eval_idx = 0
+    start_time = time.time()
+    pop_n = max(popsize * len(bounds_active), 1)
+
+    def recorded_ofv(x_active):
+        nonlocal eval_idx
+        ofv, metrics, _, p_full = objective_function(
+            x_active, m0, diso, fixed_map, active_indices, bounds_full
+        )
+        row = {"ofv": float(ofv), "nse": float(metrics["NSE"])}
+        # store full-parameter snapshot for scatter plots
+        for name, val in zip(PARAM_NAMES, p_full):
+            row[name] = float(val)
+        row["generation"] = eval_idx // pop_n
+        eval_log.append(row)
+        eval_idx += 1
+        return ofv
+    
+    def de_callback(xk, convergence):
+        ofv, metrics, _, p_full = objective_function(
+            xk, m0, diso, fixed_map, active_indices, bounds_full
+        )
+        best_by_gen.append(ofv)
+        best_params_full_by_gen.append(np.array(p_full, float))
+        best_nse_by_gen.append(float(metrics["NSE"]))
+        if convergence > 1.0:
+         return True  # tell DE to halt
+        elapsed_min = (time.time() - start_time) / 60.0
+        if (max_minutes is not None and elapsed_min >= max_minutes) or \
+           (max_evals   is not None and eval_idx   >= max_evals):
+            print(f"[{scenario}] Early stop: elapsed={elapsed_min:.2f} min, evals={eval_idx}")
+            return True
+        return False
+
+    res = differential_evolution(
+        recorded_ofv,
+        bounds=bounds_active,          # ONLY free params here
+        strategy="best1bin",
+        maxiter=maxiter,
+        popsize=popsize,
+        mutation=(0.5, 1.0),
+        recombination=0.7,
+        seed=seed,
+        callback=de_callback,
+        polish=False,
+        updating="deferred",
+        workers=1,
+        atol=1e-3, tol=1e-4
+    )
+
+    # Save eval log
+    df_eval = pd.DataFrame(eval_log)
+    df_eval.to_csv(scen_dir / "de_eval_log.csv", index=False)
+
+    # Best solution 
+    best_ofv, best_metrics, best_sim, best_full = objective_function(
+        res.x, m0, diso, fixed_map, active_indices, bounds_full
+    )
+
+    np.savetxt(scen_dir / "best_params.txt", best_full, fmt="%.6f")
+    with open(scen_dir / "best_metrics.txt", "w") as f:
+        f.write(f"Best OFV (1-NSE): {best_ofv:.6f}\n")
+        f.write(f"NSE: {best_metrics['NSE']:.6f}\n")
+
+    if best_params_full_by_gen:
+        arr = np.vstack(best_params_full_by_gen)
+        df_best = pd.DataFrame(arr, columns=PARAM_NAMES)
+        df_best.insert(0, "generation", np.arange(len(best_params_full_by_gen)))
+        df_best["best_ofv"] = best_by_gen
+        df_best["best_nse"] = best_nse_by_gen
+        df_best.to_csv(scen_dir / "de_best_by_gen.csv", index=False)
+
+    # Plots
+    plot_obs_sim(df.index, diso, best_sim, f"Observed vs Simulated (Optimized) — {scenario}", figs_dir / "optimized_run.png")
+    plot_convergence(best_by_gen, figs_dir / "de_convergence.png")
+    plot_param_paths(best_params_full_by_gen, paths_dir)
+    plot_param_scatter_by_generation(df_eval, bounds_full, scat_dir)
+
+    # Internals (with best params)
+    m0.set_parameters(best_full); m0.run_model()
+    otps = m0.get_outputs()
+    labels_raw = m0.get_output_labels()
+    labels_map = labels_raw if isinstance(labels_raw, dict) else {name: i for i, name in enumerate(labels_raw)}
+    plot_internal_vars(df.index, df, otps, labels_map, f"Internal Variables — {scenario}", figs_dir / "internal.png")
+
+    print(f"[{scenario}] Done. NSE={best_metrics['NSE']:.4f}. Outputs -> {scen_dir}")
+    return best_metrics["NSE"]
+
+
+def main():
+    ap = ArgumentParser(description="HBV001A NSE calibration + OFF-scenarios (DE, fixed-vs-free params)")
+    ap.add_argument("--data", default=None, help="Folder with time_series___24163005.csv and area___24163005.csv")
+    ap.add_argument("--scenario",
+                    choices=["all_on","snow_off","soil_off","urr_to_river","urr_to_lrr","lrr_off_qt"],
+                    default="urr_to_lrr")
+    ap.add_argument("--maxiter", type=int, default=1000, help="DE max generations")
+    ap.add_argument("--popsize", type=int, default=10, help="DE population size")
+    ap.add_argument("--seed", type=int, default=42, help="Random seed")
+    ap.add_argument("--max-minutes", dest="max_minutes", type=float, default=None, help="Wall-clock cap (minutes)")
+    ap.add_argument("--max-evals",   dest="max_evals",   type=int,   default=None, help="Evaluation cap")
+    args = ap.parse_args()
+    
+    data_dir = resolve_data_dir(args.data)
+    print("Python:", sys.executable)
+    print("Script:", __file__)
+    print("Using data_dir:", data_dir)
+
+    # Load inputs
+    ts_csv = data_dir / "time_series___24163005.csv"
+    ar_csv = data_dir / "area___24163005.csv"
+    df = pd.read_csv(ts_csv, sep=";", index_col=0)
+    df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
+    cca = float(pd.read_csv(ar_csv, sep=";", index_col=0).values[0, 0])
+
+    for c in ["tavg__ref", "pptn__ref", "petn__ref", "diso__ref"]:
+        if c not in df.columns:
+            raise KeyError(f"Missing required column '{c}' in {ts_csv}")
+
+    tems = df["tavg__ref"].values
+    ppts = df["pptn__ref"].values
+    pets = df["petn__ref"].values
+    diso = df["diso__ref"].values
+    tsps = len(tems)
+    dslr = cca / (3600 * 1000)
+
+    out_root = ensure_dir(data_dir / "results")
+
+    nse = run_scenario(
+        scenario=args.scenario,
+        tems=tems, ppts=ppts, pets=pets, tsps=tsps, dslr=dslr, diso=diso, df=df, out_root=out_root,
+        maxiter=args.maxiter, popsize=args.popsize, seed=args.seed,
+        max_minutes=args.max_minutes, max_evals=args.max_evals
+    )
+    print(f"Finished scenario '{args.scenario}'. Best NSE = {nse:.4f}")
+
+if __name__ == "__main__":
+    print(f"Started on {time.asctime()}")
+    main()
+    print(f"Finished on {time.asctime()}")
