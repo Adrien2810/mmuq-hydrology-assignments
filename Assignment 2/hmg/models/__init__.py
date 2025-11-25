@@ -351,7 +351,7 @@ class HBV001A:
         if tme_flg:
             end_tme = default_timer()
 
-            print(f'Model runtime: {end_tme - beg_tme:0.2E} seconds.')
+            # print(f'Model runtime: {end_tme - beg_tme:0.2E} seconds.')
         return
 
     def get_outputs(self):

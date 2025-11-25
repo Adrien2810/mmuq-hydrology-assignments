@@ -7,7 +7,8 @@ import traceback as tb
 from pathlib import Path
 import numpy as np
 import pandas as pd
-
+import tqdm
+import math
 import matplotlib.pyplot as plt
 
 
@@ -18,25 +19,63 @@ from hmg import HBV001A  #impirt the model
 # Optimal parameters from DE optimization
 #---------------------------------------------------------------------------------
 
+# OptimalParameterDE = np.array([0.000000, #snw_dth
+# 0.148940, #snw_att
+# 0.634415, #snw_pmf
+# 0.036731, #snw_amf
+# 94.568525,#sl0_dth
+# 432.979200, #sl0_pwp
+# 148.866130, #sl0_fcy
+# 2.659653, #sl0_bt0
+# 1.728010, #urr_dth
+# 0.739939, #lrr_dth
+# 0.748241, #urr_wsr
+# 0.185272, #urr_ulc
+# 60.579322, #urr_tdh
+# 0.143289, #urr_tdr
+# 0.000401, #urr_ndr
+# 0.000147, #urr_uct
+# 0.008535, #lrr_dre
+# 0.000024]) #lrr_lct
+# Run where we applied everything once
+# OptimalParameterDE = np.array([0.000000,
+# -0.006516,
+# 0.501091,
+# 0.047384,
+# 56.524960,
+# 542.773370,
+# 119.391360,
+# 2.178531,
+# 1.938387,
+# 0.718311,
+# 0.867841,
+# 0.175833,
+# 59.563114,
+# 0.054822,
+# 0.000035,
+# 0.000165,
+# 0.009305,
+# 0.000003
+# ])
+#Run where we plugged as param0 the previous parameter
 OptimalParameterDE = np.array([0.000000,
-0.148940,
-0.634415,
-0.036731,
-94.568525,
-432.979200,
-148.866130,
-2.659653,
-1.728010,
-0.739939,
-0.748241,
-0.185272,
-60.579322,
-0.143289,
-0.000401,
-0.000147,
-0.008535,
-0.000024])
-
+-0.005571,
+0.521145,
+0.046251,
+99.167578,
+576.309080,
+164.676837,
+2.953878,
+2.363494,
+0.304237,
+0.996199,
+0.176932,
+30.970124,
+0.182238,
+0.000003, # urr_ndr
+0.000038, #urr_uct
+0.009186,
+0.000000])
 # Parameter names in model order 
 PARAM_NAMES = [
     "snw_dth","snw_att","snw_pmf","snw_amf",
@@ -122,21 +161,60 @@ m0 = build_model(tems, ppts, pets, tsps, dslr)
 # Container initialization
 results = {}
 spaces = {}
+min_value = [] # init. min and max container for ranking later on
+max_value = []
+diff = []
+
+# Define the bounds to check for
+BOUNDS = [
+    (0.00, 0.00),   # snw_dth  (fixed 0)
+    (-2.0, 3.0),    # snw_att
+    (0.00, 3.00),   # snw_pmf
+    (0.00, 10.0),   # snw_amf
+
+    (0.00, 100.0),  # sl0_dth
+    (5.00, 700.0),  # sl0_pwp
+    (100.0, 700.0), # sl0_fcy
+    (0.01, 10.0),   # sl0_bt0
+
+    (0.00, 20.0),   # urr_dth
+    (0.00, 100.0),  # lrr_dth
+
+    (0.00, 1.00),   # urr_wsr
+    (0.00, 1.00),   # urr_ulc
+    (0.00, 200.0),  # urr_tdh
+    (0.01, 1.00),   # urr_tdr
+    (0.00, 1.00),   # urr_ndr
+    (0.00, 1.00),   # urr_uct
+
+    (0.00, 1.00),   # lrr_dre
+    (0.00, 1.00),   # lrr_lct
+]
+
 # Now start the foor loop to run over each parameter set
-for j in range(len(PARAM_NAMES)):
+for j in tqdm.tqdm(range(len(PARAM_NAMES))):
     index = j
     name = PARAM_NAMES[j]
     OptimalValue = OptimalParameterDE[j]
     # No relative but absolute change for TT
     if name != "snw_att":
-       lower = OptimalValue * 0.8
-       upper = OptimalValue * 1.2
+       lower = OptimalValue * 0.7
+       upper = OptimalValue * 1.3
     else: # absoulte change for TT
        lower = OptimalValue - 1
        upper = OptimalValue + 1
 
+    # Check if bounds are violated
+    lowerbound, upperbound = BOUNDS[index]
+
+    if upper > upperbound:
+       upper = upperbound
+
+    if lower < lowerbound:
+       lower = lowerbound
+
     # Loop over the relative changes
-    parameterspace = np.linspace(lower, upper, num=100, endpoint=True)
+    parameterspace = np.linspace(lower, upper, num=200, endpoint=True)
     spaces[name] = parameterspace
 
     ofv_values = []  # Das wird nicht klappen
@@ -150,19 +228,66 @@ for j in range(len(PARAM_NAMES)):
         ofv_values.append(ofv)
     
     results[name] = ofv_values
-
+    mini = round(np.min(ofv_values),4)
+    min_value.append(mini)
+    maxi = round(np.max(ofv_values),4)
+    max_value.append(maxi)
+    diff.append(round(np.abs(np.max(ofv_values)- np.min(ofv_values)),4))
     
+# Table outcome
+fig, ax = plt.subplots()
+fig.patch.set_visible(False)
+ax.axis('off')
+ax.axis('tight')
+
+df_results = pd.DataFrame({
+    'Parameter': PARAM_NAMES,
+    'Min': min_value,
+    'Max': max_value,
+    'Diff': diff
+})
+table = ax.table(cellText=df_results.values, colLabels=df_results.columns, loc='center')
+table.auto_set_font_size(False)
+table.set_fontsize(12)
+
+fig.tight_layout()
+plt.savefig("Table_sensitivity_analysis.png")
+plt.show()
+
+# Now the barplot with ranks
+fig_bar, ax_bar = plt.subplots(figsize=(15, 8))
+
+# Calculate ranks (highest diff gets rank 1)
+ranks = pd.Series(diff).rank(ascending=False, method='min').astype(int)
+
+# Create the bar plot
+bars = ax_bar.bar(PARAM_NAMES, diff)
+
+# Add rank numbers on top of each bar
+for bar, rank in zip(bars, ranks):
+    yval = bar.get_height()
+    ax_bar.text(bar.get_x() + bar.get_width()/2.0, yval + 0.001, rank, ha='center', va='bottom')
+
+ax_bar.set_ylabel("Maximal absolute diff")
+ax_bar.set_xlabel("Parameters")
+ax_bar.set_title("Absolute Difference in OFV per Parameter")
+ax_bar.grid(axis='y')
+#plt.xticks(rotation=45, ha='right') # Rotate labels for better readability
+fig_bar.tight_layout()
+plt.savefig("absolute_diff.png")
+plt.show()
+
+
 for name in PARAM_NAMES:
     plt.figure(figsize=(10, 6))
-    plt.plot(spaces[name], results[name], label=f"Sensitivity of NSE to {name}")
+    plt.scatter(spaces[name], results[name], label=f"Sensitivity of log(OFV) to {name}")
     plt.vlines(OptimalParameterDE[PARAM_NAMES.index(name)], ymin=min(results[name]),
-               ymax=max(results[name]), color="red", linestyle="--", label="Optimal Value")
+            ymax=max(results[name]), color="red", linestyle="--", label="Optimal Value")
+    plt.yscale("log")
     plt.xlabel(f"Parameter Value: {name}")
-    plt.ylabel("Objective Function (1 - NSE)")
+    plt.ylabel(" Objective Function (1 - NSE) on log scale")
     plt.title(f"Sensitivity Analysis for {name}")
     plt.grid()
     plt.legend()
     plt.savefig(f"sensitivity_analysis_{name}.png")
-    plt.show()
-
-    
+    #plt.show()
