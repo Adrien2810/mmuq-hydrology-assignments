@@ -1,0 +1,444 @@
+# hbv_gsa_final.py
+# Global sensitivity analysis (Sobol indices) for HBV001A
+# using SciPy Sobol quasi-random sampling and Jansen's estimator.
+#
+# Also includes a dummy test function where sum(S1) ≈ 1, to verify correctness.
+
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.stats import qmc  # Sobol quasi-random sampler
+
+from hmg import HBV001A  # HBV model class from the course package
+
+
+# =========================================================
+# 0. GLOBALS (will be set in main)
+# =========================================================
+
+hbv_model = None       # will hold HBV001A instance
+tems = ppts = pets = None
+diso = None
+tsps = None
+dslr = None
+
+
+# =========================================================
+# 1. LOAD DATA (same logic as aa_run_model.py)
+# =========================================================
+
+def load_hbv_inputs():
+    """Load time series and catchment area, return inputs and scaler."""
+    global tems, ppts, pets, diso, tsps, dslr
+
+    DATA_DIR = Path("/Users/nafisaraihana/Downloads/24163005")
+    TS_CSV = DATA_DIR / "time_series___24163005.csv"
+    AR_CSV = DATA_DIR / "area___24163005.csv"
+
+    df = pd.read_csv(TS_CSV, sep=";", index_col=0)
+    # If needed:
+    # df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
+
+    for c in ["tavg__ref", "pptn__ref", "petn__ref", "diso__ref"]:
+        if c not in df.columns:
+            raise KeyError(f"Missing required column '{c}' in {TS_CSV}")
+
+    tems = df["tavg__ref"].values
+    ppts = df["pptn__ref"].values
+    pets = df["petn__ref"].values
+    diso = df["diso__ref"].values
+
+    tsps = tems.shape[0]
+
+    cca_srs = pd.read_csv(AR_CSV, sep=";", index_col=0)
+    ccaa = float(cca_srs.values[0, 0])  # area in m²
+
+    # Conversion from mm/h to m³/s
+    dslr = ccaa / (3600.0 * 1000.0)
+
+    return df
+
+
+# =========================================================
+# 2. HBV MODEL SETUP AND OBJECTIVES
+# =========================================================
+
+def setup_hbv_model():
+    """Create and configure HBV001A model object with global inputs."""
+    global hbv_model
+
+    if any(x is None for x in [tems, ppts, pets, tsps, dslr]):
+        raise RuntimeError("Inputs not loaded before setting up HBV model.")
+
+    hbv_model = HBV001A()
+    hbv_model.set_inputs(tems, ppts, pets)
+    hbv_model.set_outputs(tsps)
+    hbv_model.set_discharge_scaler(dslr)
+    hbv_model.set_optimization_flag(0)
+
+
+def run_hbv_with_params(prms):
+    """Run HBV for a single parameter vector and return simulated discharge."""
+    prms = np.asarray(prms, dtype=np.float32)
+    hbv_model.set_parameters(prms)
+    hbv_model.set_optimization_flag(0)
+    hbv_model.run_model()
+    return hbv_model.get_discharge()
+
+
+def NSE(sim, obs):
+    """Nash-Sutcliffe efficiency."""
+    num = np.sum((sim - obs) ** 2.0)
+    den = np.sum((obs - obs.mean()) ** 2.0)
+    return 1.0 - num / den
+
+
+def LnNSE(sim, obs):
+    """Ln-transformed Nash-Sutcliffe efficiency."""
+    eps = 1e-6
+    sim2 = np.log(sim + eps)
+    obs2 = np.log(obs + eps)
+    num = np.sum((sim2 - obs2) ** 2.0)
+    den = np.sum((obs2 - obs2.mean()) ** 2.0)
+    return 1.0 - num / den
+
+
+def evaluate_hbv_matrix(X, objective="NSE"):
+    """
+    Evaluate HBV for a matrix of parameters X (N, d).
+    Returns vector y of shape (N,) with objective values.
+    We use "1 - NSE" or "1 - LnNSE" as the scalar objective for sensitivity.
+    """
+    N = X.shape[0]
+    y = np.empty(N, dtype=float)
+
+    for i in range(N):
+        sim = run_hbv_with_params(X[i, :])
+        if objective == "NSE":
+            y[i] = 1.0 - NSE(sim, diso)
+        elif objective == "LnNSE":
+            y[i] = 1.0 - LnNSE(sim, diso)
+        else:
+            raise ValueError(f"Unknown objective: {objective}")
+
+    return y
+
+
+# =========================================================
+# 3. PARAMETERS & BOUNDS
+# =========================================================
+
+# Best parameters from your optimization
+BEST_PARAMS = np.array([
+    0.000000,   # snw_dth
+   -0.006586,   # snw_att
+    0.516617,   # snw_pmf
+    0.048269,   # snw_amf
+   60.211472,   # sl0_dth
+  582.229789,   # sl0_pwp
+  120.430720,   # sl0_fcy
+    2.267393,   # sl0_bt0
+    2.800012,   # urr_dth
+    1.157213,   # lrr_dth
+    0.967106,   # urr_wsr
+    0.193777,   # urr_ulc
+  156.938341,   # urr_tdh
+    0.211724,   # urr_tdr
+    0.000059,   # urr_ndr
+    0.000796,   # urr_uct
+    0.009040,   # lrr_dre
+    0.000034,   # lrr_lct
+], dtype=float)
+
+param_names = [
+    "snw_dth",
+    "snw_att",
+    "snw_pmf",
+    "snw_amf",
+    "sl0_dth",
+    "sl0_pwp",
+    "sl0_fcy",
+    "sl0_bt0",
+    "urr_dth",
+    "lrr_dth",
+    "urr_wsr",
+    "urr_ulc",
+    "urr_tdh",
+    "urr_tdr",
+    "urr_ndr",
+    "urr_uct",
+    "lrr_dre",
+    "lrr_lct",
+]
+
+assert len(BEST_PARAMS) == len(param_names)
+
+# Full-range bounds from the model description.
+# Note: snw_dth has (0,0) in the model; we give it a tiny width so Sobol sampling is valid.
+full_range_bounds = [
+    [0.0, 1e-3],    # snw_dth  (tiny range instead of [0,0])
+    [-2.0, 3.0],    # snw_att
+    [0.0, 3.0],     # snw_pmf
+    [0.0, 10.0],    # snw_amf
+    [0.0, 100.0],   # sl0_dth
+    [5.0, 700.0],   # sl0_pwp
+    [100.0, 700.0], # sl0_fcy
+    [0.01, 10.0],   # sl0_bt0
+    [0.0, 20.0],    # urr_dth
+    [0.0, 100.0],   # lrr_dth
+    [0.0, 1.0],     # urr_wsr
+    [0.0, 1.0],     # urr_ulc
+    [0.0, 200.0],   # urr_tdh
+    [0.01, 1.0],    # urr_tdr
+    [0.0, 1.0],     # urr_ndr
+    [0.0, 1.0],     # urr_uct
+    [0.0, 1.0],     # lrr_dre
+    [0.0, 1.0],     # lrr_lct
+]
+
+# Map for clipping narrow bounds
+param_range = {
+    name: (lo, hi) for name, (lo, hi)
+    in zip(param_names, full_range_bounds)
+}
+
+# Narrow bounds around BEST_PARAMS (±20%), clipped to model limits.
+narrow_bounds = []
+for name, val in zip(param_names, BEST_PARAMS):
+    lo_lim, hi_lim = param_range[name]
+
+    if abs(val) < 1e-8:
+        # if optimum ~0, give a tiny window inside valid range
+        lo = lo_lim
+        hi = min(hi_lim, lo_lim + 1e-3)
+    else:
+        lo = max(lo_lim, 0.8 * val)
+        hi = min(hi_lim, 1.2 * val)
+
+    if not hi > lo:
+        hi = lo + 1e-6
+
+    narrow_bounds.append([lo, hi])
+
+
+# =========================================================
+# 4. SOBOL SAMPLING (SCIPY) & RADIAL DESIGN (JANSEN)
+# =========================================================
+
+def generate_sobol_AB(N, bounds):
+    """
+    Generate two independent Sobol matrices A and B in the given bounds
+    using SciPy's Sobol sampler.
+
+    We first generate an (N, 2d) matrix U in [0,1], then use each column pair
+    (2i, 2i+1) to build independent coordinates for A[:, i] and B[:, i].
+    
+    """
+    d = len(bounds)
+    sampler = qmc.Sobol(d=2 * d, scramble=True)
+
+    # U in [0,1]^(N × 2d)
+    U = sampler.random(N)  # shape: (N, 2d)
+
+    lower = np.array([lo for lo, hi in bounds], dtype=float)
+    upper = np.array([hi for lo, hi in bounds], dtype=float)
+    span = upper - lower
+
+    A = np.empty((N, d), dtype=float)
+    B = np.empty((N, d), dtype=float)
+
+    for i in range(d):
+        uA = U[:, 2 * i]
+        uB = U[:, 2 * i + 1]
+
+        A[:, i] = lower[i] + uA * span[i]
+        B[:, i] = lower[i] + uB * span[i]
+
+    return A, B
+
+
+def sobol_indices_jansen_generic(f, bounds, N, label=""):
+    """
+    Compute first-order (S1) and total-effect (ST) Sobol indices
+    using Jansen's radial design and SciPy Sobol sampling.
+
+    f: function mapping (N, d) array -> (N,) outputs
+    bounds: list [(lo, hi), ...] of length d
+    N: base sample size
+    label: optional string to print with timings
+
+    Jansen estimators:
+        V = Var[f(A)]
+        S_Ti = E[(f(A) - f(C_i))^2] / (2 V)
+        S_i  = 1 - E[(f(B) - f(C_i))^2] / (2 V)
+
+    All expectations E[·] are approximated by np.mean over the N samples.
+    """
+    d = len(bounds)
+
+    t0 = time.perf_counter()
+    A, B = generate_sobol_AB(N, bounds)
+
+    # Evaluate f on A and B
+    fA = f(A)
+    fB = f(B)
+
+    V = np.var(fA, ddof=1)
+    if V <= 0:
+        raise RuntimeError("Variance of f(A) is zero or negative; Sobol indices undefined.")
+
+    S1 = np.empty(d, dtype=float)
+    ST = np.empty(d, dtype=float)
+    evals = len(fA) + len(fB)
+
+    # Radial design: for each i, build C_i by taking A and replacing column i with B[:, i]
+    for i in range(d):
+        C_i = A.copy()
+        C_i[:, i] = B[:, i]
+
+        fC_i = f(C_i)
+        evals += len(fC_i)
+
+        # np.mean implements E[·] over the Sobol points
+        ST[i] = np.mean((fA - fC_i) ** 2.0) / (2.0 * V)
+        S1[i] = 1.0 - np.mean((fB - fC_i) ** 2.0) / (2.0 * V)
+
+    t1 = time.perf_counter()
+    print(f"Sobol (Jansen) {label}: N={N}, d={d}, evals={evals}, time={t1 - t0:.3f} s")
+
+    return S1, ST
+
+
+# =========================================================
+# 5. DUMMY TEST FUNCTION (VERIFY Σ S1 ≈ 1)
+# =========================================================
+
+def dummy_model(X):
+    """
+    Simple additive dummy model on [0,1]^3:
+        f(x1, x2, x3) = x1 + 2 x2^2 + sin(pi x3)
+    It's additive → no interactions → sum of first-order Sobol indices ≈ 1.
+    """
+    x1 = X[:, 0]
+    x2 = X[:, 1]
+    x3 = X[:, 2]
+    return x1 + 2.0 * x2**2 + np.sin(np.pi * x3)
+
+
+def run_dummy_test():
+    print("\n=== Dummy test: additive function on [0,1]^3 ===")
+
+    d_bounds = [[0.0, 1.0]] * 3
+    N_test = 4096
+
+    S1_dummy, ST_dummy = sobol_indices_jansen_generic(
+        dummy_model,
+        d_bounds,
+        N_test,
+        label="Dummy f"
+    )
+
+    print("Dummy S1:", S1_dummy)
+    print("Dummy ST:", ST_dummy)
+    print("Sum of S1 (should be close to 1):", np.sum(S1_dummy))
+
+
+# =========================================================
+# 6. PLOTTING
+# =========================================================
+
+def plot_sobol(S1, ST, title, names):
+    x = np.arange(len(names))
+    plt.figure(figsize=(10, 5))
+    plt.bar(x - 0.2, S1, width=0.4, label="S1 (first order)")
+    plt.bar(x + 0.2, ST, width=0.4, label="ST (total effect)")
+    plt.xticks(x, names, rotation=90)
+    plt.ylabel("Sobol index")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def print_sobol_table(S1, ST, names, title):
+    print(f"\n{title}")
+    print(f"{'Param':10s} {'S1':>10s} {'ST':>10s}")
+    for name, s1, st in zip(names, S1, ST):
+        print(f"{name:10s} {s1:10.3f} {st:10.3f}")
+
+
+# =========================================================
+# 7. MAIN WORKFLOW
+# =========================================================
+
+def main():
+    # --- Load data and setup HBV ---
+    df = load_hbv_inputs()
+    setup_hbv_model()
+
+    # --- Run dummy verification test ---
+    run_dummy_test()
+
+    # Define HBV objective wrappers
+    def f_HBV_NSE(X):
+        return evaluate_hbv_matrix(X, objective="NSE")
+
+    def f_HBV_LN(X):
+        return evaluate_hbv_matrix(X, objective="LnNSE")
+
+    N = 1024  # base sample size for HBV Sobol
+
+    # === 1) FULL RANGE – NSE ===
+    S1_full_NSE, ST_full_NSE = sobol_indices_jansen_generic(
+        f_HBV_NSE,
+        full_range_bounds,
+        N,
+        label="HBV full range, NSE"
+    )
+    print_sobol_table(S1_full_NSE, ST_full_NSE, param_names, "FULL RANGE – NSE")
+    plot_sobol(S1_full_NSE, ST_full_NSE, "FULL RANGE – NSE", param_names)
+
+    # === 2) FULL RANGE – LnNSE ===
+    S1_full_LN, ST_full_LN = sobol_indices_jansen_generic(
+        f_HBV_LN,
+        full_range_bounds,
+        N,
+        label="HBV full range, LnNSE"
+    )
+    print_sobol_table(S1_full_LN, ST_full_LN, param_names, "FULL RANGE – LnNSE")
+    plot_sobol(S1_full_LN, ST_full_LN, "FULL RANGE – LnNSE", param_names)
+
+    # === 3) NARROW RANGE – NSE ===
+    S1_narrow_NSE, ST_narrow_NSE = sobol_indices_jansen_generic(
+        f_HBV_NSE,
+        narrow_bounds,
+        N,
+        label="HBV narrow range, NSE"
+    )
+    print_sobol_table(S1_narrow_NSE, ST_narrow_NSE, param_names, "NARROW RANGE – NSE")
+    plot_sobol(S1_narrow_NSE, ST_narrow_NSE, "NARROW RANGE – NSE", param_names)
+
+    # === 4) NARROW RANGE – LnNSE ===
+    S1_narrow_LN, ST_narrow_LN = sobol_indices_jansen_generic(
+        f_HBV_LN,
+        narrow_bounds,
+        N,
+        label="HBV narrow range, LnNSE"
+    )
+    print_sobol_table(S1_narrow_LN, ST_narrow_LN, param_names, "NARROW RANGE – LnNSE")
+    plot_sobol(S1_narrow_LN, ST_narrow_LN, "NARROW RANGE – LnNSE", param_names)
+
+
+# =========================================================
+# 8. MAIN
+# =========================================================
+
+if __name__ == "__main__":
+    T0 = time.perf_counter()
+    main()
+    T1 = time.perf_counter()
+    print(f"\nTotal script runtime: {T1 - T0:.3f} seconds.")
