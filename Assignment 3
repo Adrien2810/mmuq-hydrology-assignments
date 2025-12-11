@@ -1,8 +1,9 @@
-# hbv_gsa_final.py
-# Global sensitivity analysis (Sobol indices) for HBV001A
-# using SciPy Sobol quasi-random sampling and Jansen's estimator.
-#
-# Also includes a dummy test function where sum(S1) ≈ 1, to verify correctness.
+
+# Complete Global Sensitivity Analysis (GSA) for HBV001A
+# - Sobol indices (first-order S1 and total-effect ST)
+# - Full range vs Narrow range (±20% of optimum)
+# - NSE vs LnNSE objective functions
+
 
 import time
 from pathlib import Path
@@ -10,17 +11,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from scipy.stats import qmc  # Sobol quasi-random sampler
 
-from hmg import HBV001A  # HBV model class from the course package
+from hmg import HBV001A  # HBV model class
 
 
 # =========================================================
-# 0. GLOBALS (will be set in main)
+#  GLOBALS
 # =========================================================
 
-hbv_model = None       # will hold HBV001A instance
+hbv_model = None
 tems = ppts = pets = None
 diso = None
 tsps = None
@@ -28,11 +30,11 @@ dslr = None
 
 
 # =========================================================
-# 1. LOAD DATA (same logic as aa_run_model.py)
+#  LOAD DATA
 # =========================================================
 
 def load_hbv_inputs():
-    """Load time series and catchment area, return inputs and scaler."""
+    """Load time series and catchment area."""
     global tems, ppts, pets, diso, tsps, dslr
 
     DATA_DIR = Path("/Users/nafisaraihana/Downloads/24163005")
@@ -40,8 +42,6 @@ def load_hbv_inputs():
     AR_CSV = DATA_DIR / "area___24163005.csv"
 
     df = pd.read_csv(TS_CSV, sep=";", index_col=0)
-    # If needed:
-    # df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
 
     for c in ["tavg__ref", "pptn__ref", "petn__ref", "diso__ref"]:
         if c not in df.columns:
@@ -51,38 +51,40 @@ def load_hbv_inputs():
     ppts = df["pptn__ref"].values
     pets = df["petn__ref"].values
     diso = df["diso__ref"].values
-
     tsps = tems.shape[0]
 
     cca_srs = pd.read_csv(AR_CSV, sep=";", index_col=0)
-    ccaa = float(cca_srs.values[0, 0])  # area in m²
-
-    # Conversion from mm/h to m³/s
+    ccaa = float(cca_srs.values[0, 0])
     dslr = ccaa / (3600.0 * 1000.0)
 
+    print(f"✓ Loaded {tsps} time steps")
+    print(f"✓ Catchment area: {ccaa/1e6:.2f} km²")
+    
     return df
 
 
 # =========================================================
-# 2. HBV MODEL SETUP AND OBJECTIVES
+#  HBV MODEL SETUP
 # =========================================================
 
 def setup_hbv_model():
-    """Create and configure HBV001A model object with global inputs."""
+    """Create and configure HBV001A model."""
     global hbv_model
 
     if any(x is None for x in [tems, ppts, pets, tsps, dslr]):
-        raise RuntimeError("Inputs not loaded before setting up HBV model.")
+        raise RuntimeError("Inputs not loaded")
 
     hbv_model = HBV001A()
     hbv_model.set_inputs(tems, ppts, pets)
     hbv_model.set_outputs(tsps)
     hbv_model.set_discharge_scaler(dslr)
     hbv_model.set_optimization_flag(0)
+    
+    print("HBV model configured")
 
 
 def run_hbv_with_params(prms):
-    """Run HBV for a single parameter vector and return simulated discharge."""
+    """Run HBV for single parameter vector."""
     prms = np.asarray(prms, dtype=np.float32)
     hbv_model.set_parameters(prms)
     hbv_model.set_optimization_flag(0)
@@ -99,7 +101,7 @@ def NSE(sim, obs):
 
 def LnNSE(sim, obs):
     """Ln-transformed Nash-Sutcliffe efficiency."""
-    eps = 1e-6
+    eps = 1e-3 #1e-3
     sim2 = np.log(sim + eps)
     obs2 = np.log(obs + eps)
     num = np.sum((sim2 - obs2) ** 2.0)
@@ -109,9 +111,9 @@ def LnNSE(sim, obs):
 
 def evaluate_hbv_matrix(X, objective="NSE"):
     """
-    Evaluate HBV for a matrix of parameters X (N, d).
-    Returns vector y of shape (N,) with objective values.
-    We use "1 - NSE" or "1 - LnNSE" as the scalar objective for sensitivity.
+    Evaluate HBV for parameter matrix X (N, d).
+    Returns y (N,) with objective values.
+    We use (1 - NSE) or (1 - LnNSE) as the minimization objective.
     """
     N = X.shape[0]
     y = np.empty(N, dtype=float)
@@ -129,10 +131,10 @@ def evaluate_hbv_matrix(X, objective="NSE"):
 
 
 # =========================================================
-# 3. PARAMETERS & BOUNDS
+#  PARAMETER DEFINITIONS
 # =========================================================
 
-# Best parameters from your optimization
+# Best parameters from ASGT-1 optimization
 BEST_PARAMS = np.array([
     0.000000,   # snw_dth
    -0.006586,   # snw_att
@@ -155,32 +157,46 @@ BEST_PARAMS = np.array([
 ], dtype=float)
 
 param_names = [
-    "snw_dth",
-    "snw_att",
-    "snw_pmf",
-    "snw_amf",
-    "sl0_dth",
-    "sl0_pwp",
-    "sl0_fcy",
-    "sl0_bt0",
-    "urr_dth",
-    "lrr_dth",
-    "urr_wsr",
-    "urr_ulc",
-    "urr_tdh",
-    "urr_tdr",
-    "urr_ndr",
-    "urr_uct",
-    "lrr_dre",
-    "lrr_lct",
+    "snw_dth", "snw_att", "snw_pmf", "snw_amf",
+    "sl0_dth", "sl0_pwp", "sl0_fcy", "sl0_bt0",
+    "urr_dth", "lrr_dth", "urr_wsr", "urr_ulc",
+    "urr_tdh", "urr_tdr", "urr_ndr", "urr_uct",
+    "lrr_dre", "lrr_lct",
 ]
 
-assert len(BEST_PARAMS) == len(param_names)
+param_descriptions = {
+    "snw_dth": "Snow depth",
+    "snw_att": "Snow temperature threshold",
+    "snw_pmf": "Snow precipitation melt factor",
+    "snw_amf": "Snow air temperature melt factor",
+    "sl0_dth": "Soil depth",
+    "sl0_pwp": "Soil permanent wilting point",
+    "sl0_fcy": "Soil field capacity",
+    "sl0_bt0": "Soil beta parameter",
+    "urr_dth": "Upper reservoir depth",
+    "lrr_dth": "Lower reservoir depth",
+    "urr_wsr": "Upper reservoir water split ratio",
+    "urr_ulc": "Upper reservoir loss coefficient",
+    "urr_tdh": "Upper reservoir threshold depth",
+    "urr_tdr": "Upper reservoir threshold drainage",
+    "urr_ndr": "Upper reservoir normal drainage",
+    "urr_uct": "Upper reservoir constant",
+    "lrr_dre": "Lower reservoir drainage",
+    "lrr_lct": "Lower reservoir constant",
+}
 
-# Full-range bounds from the model description.
-# Note: snw_dth has (0,0) in the model; we give it a tiny width so Sobol sampling is valid.
+param_categories = {
+    "snw_dth": "Snow", "snw_att": "Snow", "snw_pmf": "Snow", "snw_amf": "Snow",
+    "sl0_dth": "Soil", "sl0_pwp": "Soil", "sl0_fcy": "Soil", "sl0_bt0": "Soil",
+    "urr_dth": "Routing", "lrr_dth": "Routing", "urr_wsr": "Routing", 
+    "urr_ulc": "Routing", "urr_tdh": "Routing", "urr_tdr": "Routing",
+    "urr_ndr": "Routing", "urr_uct": "Routing", "lrr_dre": "Routing", 
+    "lrr_lct": "Routing",
+}
+
+# Full-range bounds
 full_range_bounds = [
-    [0.0, 1e-3],    # snw_dth  (tiny range instead of [0,0])
+    [0.0, 1e-3],    # snw_dth (tiny range)
     [-2.0, 3.0],    # snw_att
     [0.0, 3.0],     # snw_pmf
     [0.0, 10.0],    # snw_amf
@@ -200,19 +216,12 @@ full_range_bounds = [
     [0.0, 1.0],     # lrr_lct
 ]
 
-# Map for clipping narrow bounds
-param_range = {
-    name: (lo, hi) for name, (lo, hi)
-    in zip(param_names, full_range_bounds)
-}
-
-# Narrow bounds around BEST_PARAMS (±20%), clipped to model limits.
+# Narrow bounds (±20% of optimum, clipped to model limits)
 narrow_bounds = []
-for name, val in zip(param_names, BEST_PARAMS):
-    lo_lim, hi_lim = param_range[name]
+for i, (name, val) in enumerate(zip(param_names, BEST_PARAMS)):
+    lo_lim, hi_lim = full_range_bounds[i]
 
     if abs(val) < 1e-8:
-        # if optimum ~0, give a tiny window inside valid range
         lo = lo_lim
         hi = min(hi_lim, lo_lim + 1e-3)
     else:
@@ -226,23 +235,17 @@ for name, val in zip(param_names, BEST_PARAMS):
 
 
 # =========================================================
-# 4. SOBOL SAMPLING (SCIPY) & RADIAL DESIGN (JANSEN)
+#  SOBOL SAMPLING & JANSEN'S ESTIMATOR
 # =========================================================
 
 def generate_sobol_AB(N, bounds):
     """
-    Generate two independent Sobol matrices A and B in the given bounds
-    using SciPy's Sobol sampler.
-
-    We first generate an (N, 2d) matrix U in [0,1], then use each column pair
-    (2i, 2i+1) to build independent coordinates for A[:, i] and B[:, i].
-    
+    Generate two independent Sobol matrices A and B.
+    Uses SciPy's Sobol sampler with scrambling.
     """
     d = len(bounds)
     sampler = qmc.Sobol(d=2 * d, scramble=True)
-
-    # U in [0,1]^(N × 2d)
-    U = sampler.random(N)  # shape: (N, 2d)
+    U = sampler.random(N)  # (N, 2d) in [0,1]
 
     lower = np.array([lo for lo, hi in bounds], dtype=float)
     upper = np.array([hi for lo, hi in bounds], dtype=float)
@@ -252,50 +255,43 @@ def generate_sobol_AB(N, bounds):
     B = np.empty((N, d), dtype=float)
 
     for i in range(d):
-        uA = U[:, 2 * i]
-        uB = U[:, 2 * i + 1]
-
-        A[:, i] = lower[i] + uA * span[i]
-        B[:, i] = lower[i] + uB * span[i]
+        A[:, i] = lower[i] + U[:, 2*i] * span[i]
+        B[:, i] = lower[i] + U[:, 2*i+1] * span[i]
 
     return A, B
 
 
-def sobol_indices_jansen_generic(f, bounds, N, label=""):
+def sobol_indices_jansen(f, bounds, N, label=""):
     """
-    Compute first-order (S1) and total-effect (ST) Sobol indices
-    using Jansen's radial design and SciPy Sobol sampling.
-
-    f: function mapping (N, d) array -> (N,) outputs
-    bounds: list [(lo, hi), ...] of length d
-    N: base sample size
-    label: optional string to print with timings
-
-    Jansen estimators:
-        V = Var[f(A)]
-        S_Ti = E[(f(A) - f(C_i))^2] / (2 V)
-        S_i  = 1 - E[(f(B) - f(C_i))^2] / (2 V)
-
-    All expectations E[·] are approximated by np.mean over the N samples.
+    Compute S1 and ST using Jansen's radial design.
+    
+    Reference:
+    - Jansen, M.J.W. (1999). Analysis of variance designs for model output.
+      Computer Physics Communications, 117(1-2), 35-43.
+    
+    Estimators:
+        ST_i = E[(f(A) - f(C_i))^2] / (2*V)
+        S1_i = 1 - E[(f(B) - f(C_i))^2] / (2*V)
+    
+    These are equivalent to Saltelli et al. (2010) estimators but more
+    computationally efficient.
     """
     d = len(bounds)
 
     t0 = time.perf_counter()
     A, B = generate_sobol_AB(N, bounds)
 
-    # Evaluate f on A and B
     fA = f(A)
     fB = f(B)
 
     V = np.var(fA, ddof=1)
     if V <= 0:
-        raise RuntimeError("Variance of f(A) is zero or negative; Sobol indices undefined.")
+        raise RuntimeError("Variance is zero; Sobol indices undefined")
 
     S1 = np.empty(d, dtype=float)
     ST = np.empty(d, dtype=float)
     evals = len(fA) + len(fB)
 
-    # Radial design: for each i, build C_i by taking A and replacing column i with B[:, i]
     for i in range(d):
         C_i = A.copy()
         C_i[:, i] = B[:, i]
@@ -303,142 +299,380 @@ def sobol_indices_jansen_generic(f, bounds, N, label=""):
         fC_i = f(C_i)
         evals += len(fC_i)
 
-        # np.mean implements E[·] over the Sobol points
         ST[i] = np.mean((fA - fC_i) ** 2.0) / (2.0 * V)
         S1[i] = 1.0 - np.mean((fB - fC_i) ** 2.0) / (2.0 * V)
-
+    #sum
     t1 = time.perf_counter()
-    print(f"Sobol (Jansen) {label}: N={N}, d={d}, evals={evals}, time={t1 - t0:.3f} s")
+    print(f"  Sobol (Jansen) {label}: N={N}, d={d}, evals={evals}, time={t1-t0:.1f}s")
 
     return S1, ST
 
 
 # =========================================================
-# 5. DUMMY TEST FUNCTION (VERIFY Σ S1 ≈ 1)
+#  DUMMY TEST FUNCTION (VALIDATION)
 # =========================================================
 
 def dummy_model(X):
     """
-    Simple additive dummy model on [0,1]^3:
-        f(x1, x2, x3) = x1 + 2 x2^2 + sin(pi x3)
-    It's additive → no interactions → sum of first-order Sobol indices ≈ 1.
+    Additive test function: f(x1, x2, x3) = x1 + 2*x2^2 + sin(pi*x3)
+    For additive models, sum(S1) should equal 1.
     """
-    x1 = X[:, 0]
-    x2 = X[:, 1]
-    x3 = X[:, 2]
-    return x1 + 2.0 * x2**2 + np.sin(np.pi * x3)
+    return X[:, 0] + 2.0 * X[:, 1]**2 + np.sin(np.pi * X[:, 2])
 
 
 def run_dummy_test():
-    print("\n=== Dummy test: additive function on [0,1]^3 ===")
+    """Validate Sobol implementation with known additive function."""
+    print("\n" + "="*70)
+    print("VALIDATION TEST: Additive Dummy Function")
+    print("="*70)
 
-    d_bounds = [[0.0, 1.0]] * 3
-    N_test = 4096
+    bounds = [[0.0, 1.0]] * 3
+    N = 8192
 
-    S1_dummy, ST_dummy = sobol_indices_jansen_generic(
-        dummy_model,
-        d_bounds,
-        N_test,
-        label="Dummy f"
-    )
+    S1, ST = sobol_indices_jansen(dummy_model, bounds, N, label="Dummy")
 
-    print("Dummy S1:", S1_dummy)
-    print("Dummy ST:", ST_dummy)
-    print("Sum of S1 (should be close to 1):", np.sum(S1_dummy))
+    print(f"\nDummy S1: {S1}")
+    print(f"Dummy ST: {ST}")
+    print(f"Sum of S1: {np.sum(S1):.4f} (should be ≈ 1.0 for additive model)")
+    print(f"Max |ST - S1|: {np.max(np.abs(ST - S1)):.4f} (should be ≈ 0 for additive model)")
+    
+    if 0.95 < np.sum(S1) < 1.05:
+        print("VALIDATION PASSED")
+    else:
+        print(" VALIDATION FAILED - check implementation")
 
 
 # =========================================================
-# 6. PLOTTING
+#  ANALYSIS & COMPARISON 
 # =========================================================
-
-def plot_sobol(S1, ST, title, names):
-    x = np.arange(len(names))
-    plt.figure(figsize=(10, 5))
-    plt.bar(x - 0.2, S1, width=0.4, label="S1 (first order)")
-    plt.bar(x + 0.2, ST, width=0.4, label="ST (total effect)")
-    plt.xticks(x, names, rotation=90)
-    plt.ylabel("Sobol index")
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
 
 def print_sobol_table(S1, ST, names, title):
+    """Print formatted table of Sobol indices."""
     print(f"\n{title}")
-    print(f"{'Param':10s} {'S1':>10s} {'ST':>10s}")
+    print("="*70)
+    print(f"{'Parameter':12s} {'Category':10s} {'S1':>10s} {'ST':>10s} {'ST-S1':>10s}")
+    print("-"*70)
+    
     for name, s1, st in zip(names, S1, ST):
-        print(f"{name:10s} {s1:10.3f} {st:10.3f}")
+        cat = param_categories[name]
+        interaction = st - s1
+        print(f"{name:12s} {cat:10s} {s1:10.4f} {st:10.4f} {interaction:10.4f}")
+    
+    print("-"*70)
+    print(f"{'TOTAL':12s} {'':10s} {np.sum(S1):10.4f} {np.sum(ST):10.4f}")
+
+
+def compare_all_scenarios(results_dict):
+    """
+    Comprehensive comparison across all scenarios.
+    
+    results_dict: {
+        'Full-NSE': (S1, ST),
+        'Full-LnNSE': (S1, ST),
+        'Narrow-NSE': (S1, ST),
+        'Narrow-LnNSE': (S1, ST)
+    }
+    """
+    print("\n" + "="*70)
+    print("COMPARATIVE ANALYSIS")
+    print("="*70)
+    
+    #  TOP 5 MOST SENSITIVE PARAMETERS IN EACH SCENARIO
+    print("\n" + "-"*70)
+    print("1. TOP 5 MOST SENSITIVE PARAMETERS (by Total Effect ST)")
+    print("-"*70)
+    
+    for scenario_name, (S1, ST) in results_dict.items():
+        top_indices = np.argsort(ST)[-5:][::-1]
+        print(f"\n{scenario_name}:")
+        for rank, idx in enumerate(top_indices, 1):
+            print(f"  {rank}. {param_names[idx]:12s}: S1={S1[idx]:.4f}, ST={ST[idx]:.4f}, "
+                  f"Interact={ST[idx]-S1[idx]:.4f}")
+    
+
+    
+    #  EFFECT OF CHANGING PARAMETER RANGE
+    print("\n" + "-"*70)
+    print("3. EFFECT OF CHANGING PARAMETER RANGE (Full → Narrow)")
+    print("-"*70)
+    
+    for obj in ['NSE', 'LnNSE']:
+        print(f"\nObjective: {obj}")
+        ST_full = results_dict[f'Full-{obj}'][1]
+        ST_narrow = results_dict[f'Narrow-{obj}'][1]
+        
+        changes = ST_narrow - ST_full
+        sorted_idx = np.argsort(np.abs(changes))[::-1][:5]
+        
+        print(f"{'Parameter':12s} {'Full':>10s} {'Narrow':>10s} {'Change':>10s}")
+        for idx in sorted_idx:
+            print(f"{param_names[idx]:12s} {ST_full[idx]:10.4f} {ST_narrow[idx]:10.4f} "
+                  f"{changes[idx]:+10.4f}")
+    
+    #  EFFECT OF CHANGING OBJECTIVE FUNCTION
+    print("\n" + "-"*70)
+    print("4. EFFECT OF CHANGING OBJECTIVE FUNCTION (NSE → LnNSE)")
+    print("-"*70)
+    
+    for rng in ['Full', 'Narrow']:
+        print(f"\nRange: {rng}")
+        ST_nse = results_dict[f'{rng}-NSE'][1]
+        ST_lnnse = results_dict[f'{rng}-LnNSE'][1]
+        
+        diffs = ST_lnnse - ST_nse
+        sorted_idx = np.argsort(np.abs(diffs))[::-1][:5]
+        
+        print(f"{'Parameter':12s} {'NSE':>10s} {'LnNSE':>10s} {'Difference':>10s}")
+        for idx in sorted_idx:
+            print(f"{param_names[idx]:12s} {ST_nse[idx]:10.4f} {ST_lnnse[idx]:10.4f} "
+                  f"{diffs[idx]:+10.4f}")
+  
+def save_results_to_csv(results_dict, filename="sobol_results.csv"):
+    """Save all Sobol indices to CSV for reporting."""
+    rows = []
+    
+    for scenario_name, (S1, ST) in results_dict.items():
+        for i, name in enumerate(param_names):
+            rows.append({
+                'Scenario': scenario_name,
+                'Parameter': name,
+                'Category': param_categories[name],
+                'Description': param_descriptions[name],
+                'S1': S1[i],
+                'ST': ST[i],
+                'Interaction': ST[i] - S1[i]
+            })
+    
+    df = pd.DataFrame(rows)
+    df.to_csv(filename, index=False)
+    print(f"\n Results saved to {filename}")
 
 
 # =========================================================
-# 7. MAIN WORKFLOW
+# VISUALIZATION 
 # =========================================================
+
+def plot_single_scenario(S1, ST, names, title, filename):
+    """Bar plot for single scenario."""
+    x = np.arange(len(names))
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - 0.2, S1, width=0.4, label='S₁ (First-order)', color='steelblue')
+    ax.bar(x + 0.2, ST, width=0.4, label='Sᴛ (Total-effect)', color='coral')
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=90)
+    ax.set_ylabel('Sobol Index')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f" Saved: {filename}")
+    plt.close()
+
+
+
+def plot_range_comparison(results_dict, filename="range_comparison.png"):
+    """Side-by-side comparison of Full vs Narrow range."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    for ax, obj in zip(axes, ['NSE', 'LnNSE']):
+        ST_full = results_dict[f'Full-{obj}'][1]
+        ST_narrow = results_dict[f'Narrow-{obj}'][1]
+        
+        y = np.arange(len(param_names))
+        ax.barh(y - 0.2, ST_full, height=0.4, label='Full Range', color='steelblue')
+        ax.barh(y + 0.2, ST_narrow, height=0.4, label='Narrow Range', color='coral', alpha=0.7)
+        
+        ax.set_yticks(y)
+        ax.set_yticklabels(param_names)
+        ax.set_xlabel('Total Effect (Sᴛ)')
+        ax.set_title(f'Effect of Parameter Range: {obj}')
+        ax.legend()
+        ax.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f" Saved: {filename}")
+    plt.close()
+
+
+def plot_objective_comparison(results_dict, filename="objective_comparison.png"):
+    """Side-by-side comparison of NSE vs LnNSE."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    for ax, rng in zip(axes, ['Full', 'Narrow']):
+        ST_nse = results_dict[f'{rng}-NSE'][1]
+        ST_lnnse = results_dict[f'{rng}-LnNSE'][1]
+        
+        y = np.arange(len(param_names))
+        ax.barh(y - 0.2, ST_nse, height=0.4, label='NSE', color='steelblue')
+        ax.barh(y + 0.2, ST_lnnse, height=0.4, label='LnNSE', color='forestgreen', alpha=0.7)
+        
+        ax.set_yticks(y)
+        ax.set_yticklabels(param_names)
+        ax.set_xlabel('Total Effect (Sᴛ)')
+        ax.set_title(f'Effect of Objective Function: {rng} Range')
+        ax.legend()
+        ax.grid(axis='x', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f" Saved: {filename}")
+    plt.close()
+
+
+def plot_category_sensitivity(results_dict, filename="category_sensitivity.png"):
+    """Aggregate sensitivity by parameter category."""
+    categories = ['Snow', 'Soil', 'Routing']
+    scenarios = ['Full-NSE', 'Full-LnNSE', 'Narrow-NSE', 'Narrow-LnNSE']
+    
+    data = {cat: {sc: 0 for sc in scenarios} for cat in categories}
+    counts = {cat: 0 for cat in categories}
+    
+    for i, name in enumerate(param_names):
+        cat = param_categories[name]
+        counts[cat] += 1
+        for scenario in scenarios:
+            ST = results_dict[scenario][1]
+            data[cat][scenario] += ST[i]
+    
+    # Average per category
+    for cat in categories:
+        for scenario in scenarios:
+            data[cat][scenario] /= counts[cat]
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    x = np.arange(len(scenarios))
+    width = 0.25
+    
+    for i, cat in enumerate(categories):
+        values = [data[cat][sc] for sc in scenarios]
+        ax.bar(x + i*width, values, width, label=cat)
+    
+    ax.set_xlabel('Scenario')
+    ax.set_ylabel('Average Total Effect (Sᴛ)')
+    ax.set_title('Parameter Sensitivity by Category')
+    ax.set_xticks(x + width)
+    ax.set_xticklabels(scenarios, rotation=45, ha='right')
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f" Saved: {filename}")
+    plt.close()
+
+
+# =========================================================
+#  MAIN WORKFLOW
+# =========================================================
+
 
 def main():
-    # --- Load data and setup HBV ---
-    df = load_hbv_inputs()
+    """Main analysis workflow."""
+    
+    # Print header
+    print("\n" + "="*70)
+    print("HBV MODEL GLOBAL SENSITIVITY ANALYSIS ")
+    print("="*70)
+
+    
+    # Load data and setup model
+    print("\n" + "="*70)
+    print("STEP 1: DATA LOADING AND MODEL SETUP")
+    print("="*70)
+    load_hbv_inputs()
     setup_hbv_model()
-
-    # --- Run dummy verification test ---
+    
+    # Validation test
+    print("\n" + "="*70)
+    print("STEP 2: IMPLEMENTATION VALIDATION")
+    print("="*70)
     run_dummy_test()
-
-    # Define HBV objective wrappers
-    def f_HBV_NSE(X):
+    
+    # Define objective functions
+    def f_NSE(X):
         return evaluate_hbv_matrix(X, objective="NSE")
-
-    def f_HBV_LN(X):
+    
+    def f_LnNSE(X):
         return evaluate_hbv_matrix(X, objective="LnNSE")
-
-    N = 1024  # base sample size for HBV Sobol
-
-    # === 1) FULL RANGE – NSE ===
-    S1_full_NSE, ST_full_NSE = sobol_indices_jansen_generic(
-        f_HBV_NSE,
-        full_range_bounds,
-        N,
-        label="HBV full range, NSE"
-    )
-    print_sobol_table(S1_full_NSE, ST_full_NSE, param_names, "FULL RANGE – NSE")
-    plot_sobol(S1_full_NSE, ST_full_NSE, "FULL RANGE – NSE", param_names)
-
-    # === 2) FULL RANGE – LnNSE ===
-    S1_full_LN, ST_full_LN = sobol_indices_jansen_generic(
-        f_HBV_LN,
-        full_range_bounds,
-        N,
-        label="HBV full range, LnNSE"
-    )
-    print_sobol_table(S1_full_LN, ST_full_LN, param_names, "FULL RANGE – LnNSE")
-    plot_sobol(S1_full_LN, ST_full_LN, "FULL RANGE – LnNSE", param_names)
-
-    # === 3) NARROW RANGE – NSE ===
-    S1_narrow_NSE, ST_narrow_NSE = sobol_indices_jansen_generic(
-        f_HBV_NSE,
-        narrow_bounds,
-        N,
-        label="HBV narrow range, NSE"
-    )
-    print_sobol_table(S1_narrow_NSE, ST_narrow_NSE, param_names, "NARROW RANGE – NSE")
-    plot_sobol(S1_narrow_NSE, ST_narrow_NSE, "NARROW RANGE – NSE", param_names)
-
-    # === 4) NARROW RANGE – LnNSE ===
-    S1_narrow_LN, ST_narrow_LN = sobol_indices_jansen_generic(
-        f_HBV_LN,
-        narrow_bounds,
-        N,
-        label="HBV narrow range, LnNSE"
-    )
-    print_sobol_table(S1_narrow_LN, ST_narrow_LN, param_names, "NARROW RANGE – LnNSE")
-    plot_sobol(S1_narrow_LN, ST_narrow_LN, "NARROW RANGE – LnNSE", param_names)
+    
+    # Sample size
+    N = 8192
+    
+    # Storage for results
+    results = {}
+    
+    # Run all 4 scenarios
+    print("\n" + "="*70)
+    print("STEP 3: SOBOL ANALYSIS - 4 SCENARIOS")
+    print("="*70)
+    
+    scenarios_config = [
+        ('Full-NSE', f_NSE, full_range_bounds),
+        ('Full-LnNSE', f_LnNSE, full_range_bounds),
+        ('Narrow-NSE', f_NSE, narrow_bounds),
+        ('Narrow-LnNSE', f_LnNSE, narrow_bounds),
+    ]
+    
+    for scenario_name, func, bounds in scenarios_config:
+        print(f"\n{scenario_name}:")
+        S1, ST = sobol_indices_jansen(func, bounds, N, label=scenario_name)
+        results[scenario_name] = (S1, ST)
+        print_sobol_table(S1, ST, param_names, f"  Results: {scenario_name}")
+    
+    # Comparative analysis
+    print("\n" + "="*70)
+    print("STEP 4: COMPARATIVE ANALYSIS")
+    print("="*70)
+    compare_all_scenarios(results)
+    
+    # Save results
+    print("\n" + "="*70)
+    print("STEP 5: SAVING RESULTS")
+    print("="*70)
+    save_results_to_csv(results, "sobol_results.csv")
+    
+    # Generate all plots
+   
+    # Individual scenario plots
+    for scenario_name, (S1, ST) in results.items():
+        filename = f"sobol_{scenario_name.lower().replace('-', '_')}.png"
+        plot_single_scenario(S1, ST, param_names, 
+                           f"Sobol Indices: {scenario_name}", 
+                           filename)
+    
+    # Comparison plots
+    plot_range_comparison(results, "sobol_range_comparison.png")
+    plot_objective_comparison(results, "sobol_objective_comparison.png")
+    plot_category_sensitivity(results, "sobol_category_sensitivity.png")
+    
+   
+    
+    return results
 
 
 # =========================================================
-# 8. MAIN
+# ENTRY POINT
 # =========================================================
 
 if __name__ == "__main__":
     T0 = time.perf_counter()
-    main()
-    T1 = time.perf_counter()
-    print(f"\nTotal script runtime: {T1 - T0:.3f} seconds.")
+    
+    try:
+        results = main()
+        
+        T1 = time.perf_counter()
+        print(f"\n Total runtime: {T1 - T0:.1f} seconds ({(T1-T0)/60:.1f} minutes)")
+       
+        
+    except Exception as e:
+        print(f"\n✗ Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
