@@ -1,0 +1,610 @@
+# Assignment 4
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from hmg import HBV001A  # import the model
+import os
+import sys
+import time
+import timeit
+import traceback as tb
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import math
+import tqdm
+import matplotlib.pyplot as plt
+from scipy.optimize import differential_evolution, minimize
+
+sys.path.append(os.path.expanduser("~/.local/lib/python3.11/site-packages"))
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Define functions to calibrate Using Assignment 1
+# ----------------------------------------------------------------------------------------------------------------------
+
+PARAM_NAMES = [
+    "snw_dth", "snw_att", "snw_pmf", "snw_amf",
+    "sl0_dth", "sl0_pwp", "sl0_fcy", "sl0_bt0",
+    "urr_dth", "lrr_dth",
+    "urr_wsr", "urr_ulc", "urr_tdh", "urr_tdr", "urr_ndr", "urr_uct",
+    "lrr_dre", "lrr_lct"
+]
+# Bounds for DE
+BOUNDS = [
+    (0.00, 0.00),   # snw_dth  (fixed 0)
+    (-2.0, 3.0),    # snw_att
+    (0.00, 3.00),   # snw_pmf
+    (0.00, 10.0),   # snw_amf
+
+    (0.00, 100.0),  # sl0_dth
+    (5.00, 700.0),  # sl0_pwp
+    (100.0, 700.0),  # sl0_fcy
+    (0.01, 10.0),   # sl0_bt0
+
+    (0.00, 20.0),   # urr_dth
+    (0.00, 100.0),  # lrr_dth
+
+    (0.00, 1.00),   # urr_wsr
+    (0.00, 1.00),   # urr_ulc
+    (0.00, 200.0),  # urr_tdh
+    (0.01, 1.00),   # urr_tdr
+    (0.00, 1.00),   # urr_ndr
+    (0.00, 1.00),   # urr_uct
+
+    (0.00, 1.00),   # lrr_dre
+    (0.00, 1.00),   # lrr_lct
+]
+# Function to compute NSE
+
+
+def calc_nse(obs: np.ndarray, sim: np.ndarray) -> float:
+    """Compute NSE."""
+    obs = np.asarray(obs, float)
+    sim = np.asarray(sim, float)
+    mask = np.isfinite(obs) & np.isfinite(sim)
+    obs = obs[mask]
+    sim = sim[mask]
+    denom = np.sum((obs - obs.mean()) ** 2)
+    if denom <= 0:
+        return float("-inf")
+    return 1.0 - np.sum((obs - sim) ** 2) / denom
+
+# Initialize the model
+
+
+def build_model(tems, ppts, pets, tsps, dslr) -> HBV001A:
+    """Construct and initialize HBV001A for a run."""
+    m = HBV001A()
+    m.set_inputs(tems, ppts, pets)  # set the inputs from the time series
+    m.set_outputs(tsps)
+    m.set_discharge_scaler(dslr)
+    m.set_optimization_flag(0)  # why: we optimize externally
+    return m
+
+# Here we define the objective function for the DE optimization
+
+
+def objective_function(params, model, diso):
+    """Clamp params, run model, return (ofv=1-NSE, {'NSE': nse}, sim)."""
+    p = np.asarray(params, float).copy()
+    try:
+        # set the model parameters to the initialized model
+        model.set_parameters(p)
+    except AssertionError:
+        return 1e6, {"NSE": float("-inf")}, None
+    model.run_model()
+    sim = model.get_discharge()  # simulate the discharge
+    # calculate the NSE between observed and simulated discharge
+    nse = calc_nse(diso, sim)
+    ofv = 1.0 - nse if np.isfinite(nse) else 1e6
+    return ofv, {"NSE": float(nse)}, sim
+
+
+def simple_ofv(params, model, diso):
+    """Return only the objective function value for local search."""
+    ofv, _, _ = objective_function(params, model, diso)
+    return ofv
+
+
+def plot_obs_sim(index, obs, sim, title, out_png):
+    # index stands for the parameters
+    fig = plt.figure(figsize=(6, 3), dpi=120)
+    plt.plot(index, obs, label="OBS", alpha=0.85)
+    plt.plot(index, sim, label="SIM", alpha=0.85)
+    plt.grid(True)
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.xlabel("Time [hr]")
+    plt.ylabel("Discharge [m³/s]")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def CalibrateModel(precipitation, out_dir=None, run_tag="default_run", verbose=True):
+    max_minutes = 5.0   # stop long DE runs by wall clock
+    max_evals = 60000  # cap total objective calls
+
+    data_dir = Path(__file__).parent / 'data'
+    # data_dir = Path.home() / ... / ...
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data folder not found: {data_dir}")
+    # os.chdir(data_dir)
+    print(f"Using data from: {data_dir}")
+    # read time series and area files
+    df = pd.read_csv(data_dir / "time_series___24163005.csv",
+                     sep=";", index_col=0)
+    df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
+    cca = float(pd.read_csv(data_dir / "area___24163005.csv",
+                sep=";", index_col=0).values[0, 0])
+
+    required_cols = ["tavg__ref", "pptn__ref", "petn__ref", "diso__ref"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+    # set the parameters
+    tems = df["tavg__ref"].values
+    ppts = precipitation
+    pets = df["petn__ref"].values
+    diso = df["diso__ref"].values
+
+    tsps = len(tems)
+    dslr = cca / (3600 * 1000)
+
+    prms0 = np.array([
+        0.00, 0.10, 0.01, 0.10,
+        0.00, 300., 70.,  2.50,
+        0.00, 0.00,
+        1.00, 0.01, 30., 0.10, 0.10, 0.01,
+        1e-3, 1e-5
+    ], dtype=float)
+
+    # Baseline
+    m0 = build_model(tems, ppts, pets, tsps, dslr)
+    m0.set_parameters(prms0)
+    m0.run_model()
+    sim0 = m0.get_discharge()
+
+    # Logging containers
+    eval_params, eval_ofv = [], []
+    eval_log = []                 # every evaluation row
+    best_by_gen = []
+    best_params_by_gen = []
+    best_nse_by_gen = []
+
+    # Best-so-far snapshot
+    best_solution = {"params": None, "ofv": np.inf, "metrics": None}
+
+    #  DE settings
+    popsize = 7
+    n_params = len(BOUNDS)
+    pop_n = popsize * n_params         # approx trials per generation
+    eval_idx = 0
+    start_time = time.time()
+
+    def recorded_ofv(x):
+        nonlocal eval_idx
+        ofv, metrics, _ = objective_function(x, m0, diso)
+        eval_params.append(np.array(x, float))
+        eval_ofv.append(float(ofv))
+        # use popsize (evaluations per generation) instead of popsize * n_params
+        generation = eval_idx // popsize
+        row = {
+            "eval_idx": eval_idx,
+            "generation": generation,
+            "ofv": float(ofv),
+            "nse": float(metrics["NSE"]),
+        }
+        row.update({name: float(val) for name, val in zip(PARAM_NAMES, x)})
+        eval_log.append(row)
+        eval_idx += 1
+        return ofv
+
+    def de_callback(xk, convergence):
+        # Stop on time or eval budget
+        elapsed_min = (time.time() - start_time) / 60.0
+        if elapsed_min >= max_minutes or eval_idx >= max_evals:
+            print(
+                f"\n Stopping early: elapsed={elapsed_min:.2f} min, evals={eval_idx}")
+            return True  # stop DE
+
+          # Use last recorded evaluation for current best (avoid re-eval)
+        if eval_ofv:
+            ofv = eval_ofv[-1]
+            best_params_by_gen.append(np.array(xk, float))
+            best_by_gen.append(ofv)
+            # try to recover NSE from eval_log last row
+            best_nse_by_gen.append(eval_log[-1].get("nse", float("-inf")))
+        else:
+            # fallback: do a single evaluation (rare at start)
+            ofv, metrics, _ = objective_function(xk, m0, diso)
+            best_by_gen.append(ofv)
+            best_params_by_gen.append(np.array(xk, float))
+            best_nse_by_gen.append(float(metrics["NSE"]))
+
+        if ofv < best_solution["ofv"]:
+            best_solution["params"] = np.array(xk, float)
+            best_solution["ofv"] = ofv
+            # metrics may be unavailable here if we didn't re-eval; keep None-safe
+            best_solution["metrics"] = {"NSE": best_nse_by_gen[-1]}
+            # print(f"\n New best! Gen {len(best_by_gen)}: OFV={ofv:.4f}, NSE={best_solution['metrics']['NSE']:.4f}")
+
+        # print(f"Gen {len(best_by_gen):3d} | best (1-NSE) = {ofv:.6f}")
+        return False
+
+    res = differential_evolution(
+        recorded_ofv,
+        bounds=BOUNDS,
+        strategy="best1bin",  # A good default strategy
+        maxiter=2500,                 # Increased number of generations
+        popsize=popsize,
+        tol=1e-3,
+        # Increased upper bound for mutation to encourage more exploration
+        mutation=(0.5, 1.3),
+        recombination=0.8,  # Increased to promote more exploration
+        seed=42,
+        callback=de_callback,
+        # polish=True,
+        updating="deferred",
+        # workers=-1,
+        atol=1e-3,
+        polish=False
+    )
+
+    # Use the result from DE as the starting point for a local search
+    de_best_params = res.x
+
+    # Run scipy.minimize to polish the result
+    local_res = minimize(
+        fun=simple_ofv,
+        x0=de_best_params,
+        args=(m0, diso),
+        method='L-BFGS-B',
+        bounds=BOUNDS,
+        # Stricter tolerance for refinement
+        options={'ftol': 1e-9, 'gtol': 1e-7}
+    )
+
+    # Compare the results from DE and the local search, and pick the best one
+    best_params = local_res.x if local_res.fun < res.fun else de_best_params
+    best_ofv, best_metrics, best_sim = objective_function(
+        best_params, m0, diso)
+    print("\nOverall optimization complete. Differnetial evolution and gradient based optimizer ran successfully. Best results:")
+
+    # Prefer callback best; fallback to res.x
+    save_params = best_solution["params"] if best_solution["params"] is not None else best_params
+    save_ofv = best_solution["ofv"] if np.isfinite(
+        best_solution["ofv"]) else best_ofv
+    save_metrics = best_solution["metrics"] if best_solution["metrics"] is not None else best_metrics
+
+    # Save best
+    if out_dir is None:
+        out_dir = Path.cwd()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savetxt(out_dir / "best_params.txt", save_params, fmt="%.6f")
+    with open(out_dir / "best_metrics.txt", "w") as f:
+        f.write(f"Best OFV (1-NSE): {save_ofv:.6f}\n")
+        f.write(f"NSE: {save_metrics['NSE']:.4f}\n")
+
+    # Save ALL evaluations table
+    pd.DataFrame(eval_log).to_csv(out_dir / "de_eval_log.csv", index=False)
+
+    # Save per-generation current-best table
+    if best_params_by_gen:
+        arr = np.vstack(best_params_by_gen)
+        df_best = pd.DataFrame(arr, columns=PARAM_NAMES)
+        df_best.insert(0, "generation", np.arange(len(best_params_by_gen)))
+        df_best["best_ofv"] = best_by_gen
+        df_best["best_nse"] = best_nse_by_gen
+        df_best.to_csv(out_dir / "de_best_by_gen.csv", index=False)
+
+    if verbose:
+        print(
+            f"[{run_tag}] Best objective (1 - NSE): {save_ofv:.6f} | NSE: {save_metrics['NSE']:.4f}")
+
+    print(f"Best objective (1 - NSE): {best_ofv:.6f}")
+    print("Best-fit NSE:", round(best_metrics["NSE"], 4))
+
+    return save_params, save_ofv, save_metrics, best_sim
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Now we perturb precipitation and let the model run
+# ----------------------------------------------------------------------------------------------------------------------
+
+
+Nsim = 200  # number of simulations
+# Initialize
+# to store best parameters for each calibration run
+CalibratedParameters_REF = np.zeros((Nsim, len(PARAM_NAMES)))
+OFVs_REF = []  # to store objective function values
+SimulationResults_REF = []  # to store simulation results for boxplots etc.
+# to store best parameters for each calibration run
+CalibratedParameters = np.zeros((Nsim, len(PARAM_NAMES)))
+OFVs = []  # to store objective function values
+SimulationResults = []  # to store simulation results for boxplots etc.
+precipitation_perturbed_all = []
+data_dir = Path(__file__).parent / 'data'
+if not data_dir.exists():
+    raise FileNotFoundError(f"Data folder not found: {data_dir}")
+
+# Required data for simulation of old discharge
+data_dir = Path(__file__).parent / 'data'
+df = pd.read_csv(data_dir / "time_series___24163005.csv", sep=";", index_col=0)
+df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
+pptn_ref = df["pptn__ref"].values
+cca = float(pd.read_csv(data_dir / "area___24163005.csv",
+            sep=";", index_col=0).values[0, 0])
+tems = df["tavg__ref"].values
+pets = df["petn__ref"].values
+diso = df["diso__ref"].values
+tsps = len(tems)
+dslr = cca / (3600 * 1000)
+Best_Parameter_Assignment1 = np.array([
+    0.000000,
+    -0.005571,
+    0.521145,
+    0.046251,
+    99.167578,
+    576.309080,
+    164.676837,
+    2.953878,
+    2.363494,
+    0.304237,
+    0.996199,
+    0.176932,
+    30.970124,
+    0.182238,
+    0.000003,
+    0.000038,
+    0.009186,
+    0.000000
+])
+
+
+def _worker_run(i, seed):
+    # Alles im Worker laden (kein großer Pickle-Overhead, sauber pro Prozess)
+    data_dir = Path(__file__).parent / 'data'
+    df = pd.read_csv(data_dir / "time_series___24163005.csv",
+                     sep=";", index_col=0)
+    df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
+
+    pptn_ref = df["pptn__ref"].values
+    tems = df["tavg__ref"].values
+    pets = df["petn__ref"].values
+    diso = df["diso__ref"].values
+
+    cca = float(pd.read_csv(data_dir / "area___24163005.csv",
+                sep=";", index_col=0).values[0, 0])
+    tsps = len(tems)
+    dslr = cca / (3600 * 1000)
+
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(1.0, 0.05, size=pptn_ref.shape)
+    pptn_perturbed = np.maximum(noise * pptn_ref, 0.0)
+
+    # pro Run eigener Output-Ordner
+    out_root = Path(__file__).parent / "mc_parallel_outputs"
+    run_dir = out_root / f"run_{i:03d}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Kalibrieren
+    best_params, best_ofv, best_metrics, best_sim = CalibrateModel(
+        pptn_perturbed, out_dir=run_dir, run_tag=f"run_{i:03d}", verbose=False
+    )
+
+    # Referenz-OFV (Assignment 1 Params auf perturbed pptn)
+    model = build_model(tems, pptn_perturbed, pets, tsps, dslr)
+    best_ofv_REF, _, best_sim_REF = objective_function(
+        Best_Parameter_Assignment1, model, diso)
+
+    # optional: auch REF speichern
+    with open(run_dir / "ref_metrics.txt", "w") as f:
+        f.write(f"REF OFV (1-NSE): {best_ofv_REF:.6f}\n")
+
+    return (i, best_params, float(best_ofv), best_sim, float(best_ofv_REF), best_sim_REF, pptn_perturbed)
+
+
+if __name__ == "__main__":
+    # --- Parallel ausführen ---
+    CalibratedParameters = np.zeros((Nsim, len(PARAM_NAMES)))
+    CalibratedParameters_REF = np.zeros(
+        (Nsim, len(PARAM_NAMES)))  # bleibt ggf. leer/0 wie bisher
+    OFVs, OFVs_REF = [], []
+    SimulationResults, SimulationResults_REF = [], []
+    precipitation_perturbed_all = [None] * Nsim
+
+    base_seed = 42
+    seeds = [base_seed + i for i in range(Nsim)]
+
+    max_workers = os.cpu_count() or 4
+
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_worker_run, i, seeds[i]) for i in range(Nsim)]
+        for fut in tqdm.tqdm(as_completed(futures), total=Nsim):
+            i, best_params, best_ofv, best_sim, best_ofv_REF, best_sim_REF, pptn_perturbed = fut.result()
+
+            CalibratedParameters[i, :] = best_params
+            OFVs.append(round(best_ofv, 3))
+            SimulationResults.append(best_sim)
+
+            OFVs_REF.append(round(best_ofv_REF, 3))
+            SimulationResults_REF.append(best_sim_REF)
+
+            precipitation_perturbed_all[i] = pptn_perturbed
+
+    print("\nAlle parallelen Kalibrierungen abgeschlossen.")
+
+    print("\n Now we proceed to plotting the results")
+    # ----------------------------------------------------------------------------------------------------------------------
+    # ----------------------------------------------------------------------------------------------------------------------
+    # Now that we ran and calibrated everything, we go ahead and plot several results to interpret
+    # CDF plots of OFVs
+
+    def plot_cdf_ofvs(ofvs_ref, ofvs_perturbed, out_png):
+        fig = plt.figure(figsize=(6, 4), dpi=120)
+        # sort the ofvs which you round to then count the individual values
+        sorted_ref = np.sort(ofvs_ref)
+        sorted_perturbed = np.sort(ofvs_perturbed)
+        # Plus 1 as python counts from zero. Now count cumulative probabilities (obs i / total obs)
+        p_ref = np.arange(1, len(sorted_ref) + 1) / len(sorted_ref)
+        p_perturbed = np.arange(1, len(sorted_perturbed) +
+                                1) / len(sorted_perturbed)
+        plt.plot(sorted_ref, p_ref, label="Reference Precipitation",
+                 marker='o', linestyle='-', markersize=4)
+        plt.plot(sorted_perturbed, p_perturbed, label="Perturbed Precipitation",
+                 marker='s', linestyle='--', markersize=4)
+        plt.xlabel("Objective Function Value (1 - NSE)")
+        plt.ylabel("Cumulative Probability")
+        plt.title("CDF of Objective Function Values")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+    plot_cdf_ofvs(OFVs_REF, OFVs, "cdf_ofvs.png")
+
+    # CDF's of the parameters
+
+    def plot_cdf_params(params_ref, params_perturbed, out_png):
+        fig, axs = plt.subplots(len(PARAM_NAMES), 1, figsize=(
+            6, 3 * len(PARAM_NAMES)), dpi=120)
+        for i, name in enumerate(PARAM_NAMES):
+            sorted_ref = np.sort(params_ref[:, i])
+            sorted_pertubed = np.sort(params_perturbed[:, i])
+            p_ref = np.arange(1, len(sorted_ref) + 1) / len(sorted_ref)
+            p_perturbed = np.arange(
+                1, len(sorted_pertubed) + 1) / len(sorted_pertubed)
+            axs[i].plot(sorted_ref, p_ref, label="Reference Precipitation",
+                        marker='o', linestyle='-', markersize=4)
+            axs[i].plot(sorted_pertubed, p_perturbed, label="Perturbed Precipitation",
+                        marker='s', linestyle='--', markersize=4)
+            axs[i].set_xlabel(f"Parameter: {name}")
+            axs[i].set_ylabel("Cumulative Probability")
+            axs[i].set_title(f"CDF of {name}")
+            axs[i].grid(True)
+            axs[i].legend()
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+    plot_cdf_params(CalibratedParameters_REF,
+                    CalibratedParameters, "cdf_parameters.png")
+
+    def plot_cdf_precipitation(precip_ref, precip_perturbed, out_png):
+        fig = plt.figure(figsize=(6, 4), dpi=120)
+        sorted_ref = np.sort(precip_ref)
+        sorted_perturbed = np.sort(precip_perturbed)
+        p_ref = np.arange(1, len(sorted_ref) + 1) / len(sorted_ref)
+        p_perturbed = np.arange(1, len(sorted_perturbed) +
+                                1) / len(sorted_perturbed)
+        plt.plot(sorted_ref, p_ref, label="Reference Precipitation",
+                 marker='o', linestyle='-', markersize=4)
+        plt.plot(sorted_perturbed, p_perturbed, label="Perturbed Precipitation",
+                 marker='s', linestyle='--', markersize=4)
+        plt.xlabel("Precipitation [mm/hr]")
+        plt.ylabel("Cumulative Probability")
+        plt.title("CDF of Precipitation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+    pptn_perturbed_example = precipitation_perturbed_all[0]
+    plot_cdf_precipitation(pptn_ref, pptn_perturbed_example,
+                           "cdf_precipitation.png")
+
+    # Scatterplots of OFVS vs perturbed inputs
+
+    def plot_scatter_ofvs_precipitation(OFVs, OFVs_REF, out_png):
+        fig = plt.figure(figsize=(6, 4), dpi=120)
+        plt.scatter(OFVs, OFVs_REF, alpha=0.7)
+        # Add the angle bisector (1:1 line)
+        min_val = min(min(OFVs), min(OFVs_REF))
+        max_val = max(max(OFVs), max(OFVs_REF))
+        plt.plot([min_val, max_val], [min_val, max_val],
+                 'r--', label='1:1 line (angle bisector)')
+        plt.xlabel("OFV when recalibrating after perturbation")
+        plt.ylabel("OFV when using parameters from assignment 1")
+        plt.title("Scatterplot of OFVs")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+    # Call the function to plot the scatterplot
+    plot_scatter_ofvs_precipitation(OFVs, OFVs_REF, "scatter_ofvs.png")
+
+    # Function to count how often we got better by chance when recalibratingg and what the min OFV was.
+
+    def analyze_ofv_improvements(ofvs_ref, ofvs_perturbed):
+        improvements = [1 if ofvs_perturbed[i] < ofvs_ref[i]
+                        else 0 for i in range(len(ofvs_ref))]
+        improvement_count = sum(improvements)
+        min_ofv_perturbed = min(ofvs_perturbed)
+        print(
+            f"\nNumber of times recalibration led to better OFV: {improvement_count} out of {len(ofvs_ref)}")
+        print(
+            f"Minimum OFV achieved after recalibration: {min_ofv_perturbed:.6f}")
+        return improvement_count, min_ofv_perturbed
+
+    analyze_ofv_improvements(OFVs_REF, OFVs)
+
+    # Boxplots of the simulation results for the individul parameter
+
+    def boxplot_parameters_results(parameter_name, parameter_values, ref_parameter, out_png):
+        for j in range(len(parameter_name)):
+            fig = plt.figure(figsize=(10, 6), dpi=120)
+            plt.boxplot([parameter_values[i][j] for i in range(
+                len(parameter_values))], labels=[parameter_name[j]], showfliers=False)
+            plt.scatter(1, ref_parameter[j], color='red',
+                        label='Reference Parameter', zorder=5)
+            plt.xticks(rotation=90)
+            plt.xlabel("Parameters")
+            plt.ylabel("Parameter Value")
+            plt.title(f"Boxplot of Parameter: {parameter_name[j]}")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(out_png.replace(
+                ".png", f"_{parameter_name[j]}.png"), dpi=200, bbox_inches="tight")
+            plt.show()
+            plt.close(fig)
+
+    boxplot_parameters_results(PARAM_NAMES, CalibratedParameters,
+                               Best_Parameter_Assignment1, "boxplot_parameters_results.png")
+
+    # Now plot some of the recalibrated results against observed discharge diso
+
+    def plot_all_sim_obs(index, obs, sim_results, title, out_png):
+        fig = plt.figure(figsize=(10, 6), dpi=120)
+        plt.plot(index, obs, label="Observed Discharge",
+                 linewidth=3, color='black')
+        for j, sim in enumerate(sim_results):
+            plt.plot(index, sim, label=f"Simulated {j+1}", alpha=0.7)
+        plt.grid(True)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.xlabel("Time [hr]")
+        plt.ylabel("Discharge [m³/s]")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+    # Randomly sample 6 simulations
+    np.random.seed(42)  # for reproducibility
+    random_indices = np.random.choice(len(SimulationResults), 6, replace=False)
+    selected_sims = [SimulationResults[i] for i in random_indices]
+
+    plot_all_sim_obs(df.index, diso, selected_sims,
+                     "Observed Discharge and 6 Random Simulated Discharges", "Random_6_Simulations_Discharge.png")
