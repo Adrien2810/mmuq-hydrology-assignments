@@ -280,12 +280,12 @@ def CalibrateModel(precipitation):
 # Now we perturb precipitation and let the model run 
 #----------------------------------------------------------------------------------------------------------------------
 
-Nsim = 20 #number of simulations
+Nsim = 200 #number of simulations
 # Initialize  
-CalibratedParameters_REF = np.zeros((Nsim, len(PARAM_NAMES))) #to store best parametres for each calibration run
+CalibratedParameters_REF = np.zeros((Nsim, len(PARAM_NAMES))) #to store best parameters for each calibration run
 OFVs_REF = []  # to store objective function values
 SimulationResults_REF = []  # to store simulation results for boxplots etc.
-CalibratedParameters = np.zeros((Nsim, len(PARAM_NAMES))) #to store best parametres for each calibration run
+CalibratedParameters = np.zeros((Nsim, len(PARAM_NAMES))) #to store best parameters for each calibration run
 OFVs = []  # to store objective function values
 SimulationResults = []  # to store simulation results for boxplots etc.
 precipitation_perturbed_all = []
@@ -293,32 +293,17 @@ data_dir = Path(__file__).parent / 'data'
 if not data_dir.exists():
     raise FileNotFoundError(f"Data folder not found: {data_dir}")
 
+#Required data for simulation of old discharge
+data_dir = Path(__file__).parent / 'data' 
 df = pd.read_csv(data_dir / "time_series___24163005.csv", sep=";", index_col=0)
+df.index = pd.to_datetime(df.index, format="%Y-%m-%d-%H")
 pptn_ref = df["pptn__ref"].values
-
-#Loop over number of sim
-
-for i in tqdm.tqdm(range(Nsim)):
-    print(f"\n--- Calibration run {i+1} of {Nsim} ---")
-    # Perturb precipitation with normal noise
-    pptn = pptn_ref
-    noise = np.random.normal(1, 0.05, size=pptn.shape)
-    pptn_perturbed = np.maximum(noise * pptn, 0.0)  # ensure no negative precipitation
-    precipitation_perturbed_all.append(pptn_perturbed)
-    # Calibrate model with perturbed precipitation
-    best_params, best_ofv, best_metrics, best_sim = CalibrateModel(pptn_perturbed)
-    # Calibrate model with reference precipitation
-    best_params_REF, best_ofv_REF, best_metrics_REF, best_sim_REF = CalibrateModel(pptn)
-    # Store results
-    CalibratedParameters[i, :] = best_params
-    OFVs.append(best_ofv)
-    SimulationResults.append(best_sim)
-
-    CalibratedParameters_REF[i, :] = best_params_REF
-    OFVs_REF.append(best_ofv_REF)
-    SimulationResults_REF.append(best_sim_REF)
-    print(f"\n--- Calibration run {i+1} of {Nsim} succesfully completed ---")
-
+cca = float(pd.read_csv(data_dir / "area___24163005.csv", sep=";", index_col=0).values[0, 0])
+tems = df["tavg__ref"].values
+pets = df["petn__ref"].values
+diso = df["diso__ref"].values
+tsps = len(tems)
+dslr = cca / (3600 * 1000)
 Best_Parameter_Assignment1 = np.array([
     0.000000,
     -0.005571,
@@ -339,7 +324,32 @@ Best_Parameter_Assignment1 = np.array([
     0.009186,
     0.000000
 ])
+
+#Loop over number of sim
+for i in tqdm.tqdm(range(Nsim)):
+    print(f"\n--- Calibration run {i+1} of {Nsim} ---")
+    # Perturb precipitation with normal noise
+    pptn = pptn_ref
+    noise = np.random.normal(1, 0.05, size=pptn.shape)
+    pptn_perturbed = np.maximum(noise * pptn, 0.0)  # ensure no negative precipitation
+    precipitation_perturbed_all.append(pptn_perturbed)
+    # Calibrate model with perturbed precipitation
+    best_params, best_ofv, best_metrics, best_sim = CalibrateModel(pptn_perturbed)
+    # Calibrate model with reference precipitation
+    model = build_model(tems,pptn_perturbed, pets, tsps, dslr)
+    best_ofv_REF, _, best_sim_REF = objective_function(Best_Parameter_Assignment1, model,diso)
+    # Store results
+    CalibratedParameters[i, :] = best_params
+    OFVs.append(np.round(best_ofv,3))
+    SimulationResults.append(best_sim)
+    OFVs_REF.append(np.round(best_ofv_REF,3))
+    SimulationResults_REF.append(best_sim_REF)
+    print(f"\n--- Calibration run {i+1} of {Nsim} succesfully completed ---")
+
+
 print("\n Now we proceed to plotting the results")
+#----------------------------------------------------------------------------------------------------------------------
+#----------------------------------------------------------------------------------------------------------------------
 # Now that we ran and calibrated everything, we go ahead and plot several results to interpret
 # CDF plots of OFVs
 def plot_cdf_ofvs(ofvs_ref, ofvs_perturbed, out_png):
@@ -384,34 +394,92 @@ def plot_cdf_params(params_ref, params_perturbed, out_png):
 
 plot_cdf_params(CalibratedParameters_REF, CalibratedParameters, "cdf_parameters.png")
 
-# Scatterplots of OFVS vs perturbed inputs
-def plot_scatter_ofvs_precipitation(precip_ref, precip_perturbed, ofvs_perturbed, out_png):
+def plot_cdf_precipitation(precip_ref, precip_perturbed, out_png):
     fig = plt.figure(figsize=(6, 4), dpi=120)
-    avg_perturbed = np.mean(precip_perturbed, axis=1)
-    plt.scatter(avg_perturbed, ofvs_perturbed, alpha=0.7)
-    plt.xlabel("Average Perturbed Precipitation")
-    plt.ylabel("Objective Function Value (1 - NSE)")
-    plt.title("Scatterplot of OFV vs Average Perturbed Precipitation")
+    sorted_ref = np.sort(precip_ref)
+    sorted_perturbed = np.sort(precip_perturbed)
+    p_ref = np.arange(1, len(sorted_ref) + 1) / len(sorted_ref)
+    p_perturbed = np.arange(1, len(sorted_perturbed) + 1) / len(sorted_perturbed)
+    plt.plot(sorted_ref, p_ref, label="Reference Precipitation", marker='o', linestyle='-', markersize=4)
+    plt.plot(sorted_perturbed, p_perturbed, label="Perturbed Precipitation", marker='s', linestyle='--', markersize=4)
+    plt.xlabel("Precipitation [mm/hr]")
+    plt.ylabel("Cumulative Probability")
+    plt.title("CDF of Precipitation")
     plt.grid(True)
+    plt.legend()
     plt.tight_layout()
     plt.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.show()
     plt.close(fig)
-plot_scatter_ofvs_precipitation(pptn, precipitation_perturbed_all, OFVs, "scatter_ofvs_precipitation.png")
 
-# Boxplots of the simulation results 
-def boxplot_simulation_results(sim_results_ref, sim_results_perturbed, out_png):
+plot_cdf_precipitation(pptn_ref, pptn_perturbed, "cdf_precipitation.png")
+
+# Scatterplots of OFVS vs perturbed inputs
+def plot_scatter_ofvs_precipitation(OFVs, OFVs_REF, out_png):
+    fig = plt.figure(figsize=(6, 4), dpi=120)
+    plt.scatter(OFVs, OFVs_REF, alpha=0.7)
+    # Add the angle bisector (1:1 line)
+    min_val = min(min(OFVs), min(OFVs_REF))
+    max_val = max(max(OFVs), max(OFVs_REF))
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='1:1 line (angle bisector)')
+    plt.xlabel("OFV when recalibrating after perturbation")
+    plt.ylabel("OFV when using parameters from assignment 1")
+    plt.title("Scatterplot of OFVs")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+# Call the function to plot the scatterplot
+plot_scatter_ofvs_precipitation(OFVs, OFVs_REF, "scatter_ofvs.png")
+
+# Function to count how often we got better by chance when recalibratingg and what the min OFV was.
+def analyze_ofv_improvements(ofvs_ref, ofvs_perturbed):
+    improvements = [1 if ofvs_perturbed[i] < ofvs_ref[i] else 0 for i in range(len(ofvs_ref))]
+    improvement_count = sum(improvements)
+    min_ofv_perturbed = min(ofvs_perturbed)
+    print(f"\nNumber of times recalibration led to better OFV: {improvement_count} out of {len(ofvs_ref)}")
+    print(f"Minimum OFV achieved after recalibration: {min_ofv_perturbed:.6f}")
+    return improvement_count, min_ofv_perturbed
+
+analyze_ofv_improvements(OFVs_REF, OFVs)
+
+
+# Boxplots of the simulation results for the individul parameter
+def boxplot_parameters_results(parameter_name, parameter_values, ref_parameter, out_png):
+    for j in range(len(parameter_name)):
+        fig = plt.figure(figsize=(10, 6), dpi=120)
+        plt.boxplot([parameter_values[i][j] for i in range(len(parameter_values))], labels=[parameter_name[j]], showfliers=False)
+        plt.scatter(1, ref_parameter[j], color='red', label='Reference Parameter', zorder=5)
+        plt.xticks(rotation=90)
+        plt.xlabel("Parameters")
+        plt.ylabel("Parameter Value")
+        plt.title(f"Boxplot of Parameter: {parameter_name[j]}")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png.replace(".png", f"_{parameter_name[j]}.png"), dpi=200, bbox_inches="tight")
+        plt.show()
+        plt.close(fig)
+
+boxplot_parameters_results(PARAM_NAMES, CalibratedParameters, Best_Parameter_Assignment1, "boxplot_parameters_results.png")
+
+#Now plot some of the recalibrated results against observed discharge diso
+def plot_all_sim_obs(index, obs, sim_results, title, out_png):
     fig = plt.figure(figsize=(10, 6), dpi=120)
-    data = [sim_results_ref[i] for i in range(len(sim_results_ref))] + [sim_results_perturbed[i] for i in range(len(sim_results_perturbed))]
-    labels = [f"Ref {i+1}" for i in range(len(sim_results_ref))] + [f"Pert {i+1}" for i in range(len(sim_results_perturbed))]
-    plt.boxplot(data, labels=labels, showfliers=False)
-    plt.xticks(rotation=90)
-    plt.xlabel("Simulation Runs")
-    plt.ylabel("Discharge [m³/s]")
-    plt.title("Boxplot of Simulation Results")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=200, bbox_inches="tight")
-    plt.show()
-    plt.close(fig)
+    plt.plot(index, obs, label="Observed Discharge", linewidth=3, color='black')
+    for j, sim in enumerate(sim_results):
+        plt.plot(index, sim, label=f"Simulated {j+1}", alpha=0.7)
+    plt.grid(True); plt.legend()
+    plt.xticks(rotation=45)
+    plt.xlabel("Time [hr]"); plt.ylabel("Discharge [m³/s]")
+    plt.title(title)
+    plt.tight_layout(); plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.show(); plt.close(fig)
 
-boxplot_simulation_results(SimulationResults_REF, SimulationResults, "boxplot_simulation_results.png")
+# Randomly sample 6 simulations
+np.random.seed(42)  # for reproducibility
+random_indices = np.random.choice(len(SimulationResults), 6, replace=False)
+selected_sims = [SimulationResults[i] for i in random_indices]
+
+plot_all_sim_obs(df.index, diso, selected_sims, "Observed Discharge and 6 Random Simulated Discharges", "Random_6_Simulations_Discharge.png")
