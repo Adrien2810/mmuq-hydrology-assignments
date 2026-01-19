@@ -106,7 +106,7 @@ def main():
     dslr = cca / (3600 * 1000)
     #--------------------------------------------------------------------------------------
     # Use Nsim instead of SobolSampleSize
-    Nsim = 2000
+    Nsim = 10
     # Use float32 as HBV001A does so as well and it is less expensive
     dtyp = np.float32
     mprg_pool_size = 8
@@ -212,6 +212,25 @@ def main():
     print(f"Successfully processed {len(result)} simulations.")
     #===========================================================================
      #==========================================================================
+    # Save all results to CSV
+    data = []
+    for j in range(Nsim):
+        row = {
+            'Simulation_ID': j,
+            'OFV': OFV[j],
+            'OFV_REF': OFV_REF[j],
+            'NSE': Metrics[j]['NSE'],
+        }
+        for k, name in enumerate(PARAM_NAMES):
+            row[name] = CalibratedParameters[j][k]
+            row[f'{name}_ref'] = Best_Parameter_Assignment1[k]
+        data.append(row)
+    df = pd.DataFrame(data)
+    df.to_csv('all_results.csv', index=False)
+    df.to_excel('all_results.xlsx', index=False)
+    print(f"Results saved to {os.getcwd()}/all_results.csv")
+    print("Results saved to all_results.csv")
+    #===========================================================================
     mprg_pool.close()
 
     end_tmr = timeit.default_timer()
@@ -462,13 +481,13 @@ def CalibrateModel(precipitation, ags, model):
     save_metrics = best_solution["metrics"] if best_solution["metrics"] is not None else best_metrics
 
     # Save best
-    np.savetxt("best_params.txt", save_params, fmt="%.6f")
-    with open("best_metrics.txt", "w") as f:
+    np.savetxt(f"best_params_{i}.txt", save_params, fmt="%.6f")
+    with open(f"best_metrics_{i}.txt", "w") as f:
         f.write(f"Best OFV (1-NSE): {save_ofv:.6f}\n")
         f.write(f"NSE: {save_metrics['NSE']:.4f}\n")
 
     # Save ALL evaluations table
-    pd.DataFrame(eval_log).to_csv("de_eval_log.csv", index=False)
+    pd.DataFrame(eval_log).to_csv(f"de_eval_log_{i}.csv", index=False)
 
     # Save per-generation current-best table
     if best_params_by_gen:
@@ -477,7 +496,7 @@ def CalibrateModel(precipitation, ags, model):
         df_best.insert(0, "generation", np.arange(len(best_params_by_gen)))
         df_best["best_ofv"] = best_by_gen
         df_best["best_nse"] = best_nse_by_gen
-        df_best.to_csv("de_best_by_gen.csv", index=False)
+        df_best.to_csv(f"de_best_by_gen_{i}.csv", index=False)
 
     #print(f"Best objective (1 - NSE): {best_ofv:.6f}")
     #print("Best-fit NSE:", round(best_metrics["NSE"], 4))
@@ -594,7 +613,7 @@ def boxplot_parameters_results(parameter_name, parameter_values, ref_parameter, 
         plt.legend()
         plt.tight_layout()
         plt.savefig(out_png.replace(".png", f"_{parameter_name[j]}.png"), dpi=200, bbox_inches="tight")
-        plt.show()
+        #plt.show()
         plt.close(fig)
 #Now plot some of the recalibrated results against observed discharge diso
 def plot_all_sim_obs(index, obs, sim_results, title, out_png):
