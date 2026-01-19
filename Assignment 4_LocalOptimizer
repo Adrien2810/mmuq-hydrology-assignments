@@ -1,0 +1,652 @@
+"""
+ASSIGNMENT 4
+
+ALL PLOTS:
+1. CDF of precipitation (verification)
+2. CDF of OFVs/NSE (fixed vs recalibrated)
+3. CDF of all parameters (18 panels)
+4. Scatter: OFVs fixed vs recalibrated (1:1 line)
+5. Scatter: relative change vs NSE
+6. Boxplots of each parameter (18 individual plots)
+7. Hydrograph: simulated vs observed discharge
+
+PERTURBATION OPTIONS:
+- 5% standard (N(1, 0.05))
+- 25% option (N(1, 0.125))
+
+ANSWERS:
+- Q1: How often better by chance?
+- Q2: Compensation amount?
+- Q3: Use input uncertainty?
+
+
+"""
+
+import os, time, gc
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from scipy.optimize import minimize
+
+# =============================================================================
+# IMPORT HBV
+# =============================================================================
+
+def import_hbv_model():
+    """Import HBV001A from hmg package with robust error handling."""
+    import importlib
+    import pkgutil
+    
+    HBV001A = None
+    last_error = None
+    
+    # Try common import paths
+    for module_path in ["hmg", "hmg.hbv", "hmg.models", "hmg.models.hbv001a", "hmg.hbv001a"]:
+        try:
+            mod = importlib.import_module(module_path)
+            if hasattr(mod, "HBV001A"):
+                HBV001A = getattr(mod, "HBV001A")
+                print(f" Found HBV001A in {module_path}")
+                return HBV001A
+        except Exception as e:
+            last_error = e
+    
+    # If not found, walk through all submodules
+    if HBV001A is None:
+        try:
+            import hmg
+            for info in pkgutil.walk_packages(hmg.__path__, hmg.__name__ + "."):
+                try:
+                    m = importlib.import_module(info.name)
+                    if hasattr(m, "HBV001A"):
+                        HBV001A = getattr(m, "HBV001A")
+                        print(f" Found HBV001A in {info.name}")
+                        return HBV001A
+                except Exception:
+                    pass
+        except Exception as e:
+            last_error = e
+    
+    # If still not found, raise error
+    if HBV001A is None:
+        raise ImportError(
+            "Could not locate HBV001A in 'hmg' package.\n"
+            "Please ensure hmg is installed:\n"
+            "  pip install hmg\n"
+            f"Last error: {last_error}"
+        )
+    
+    return HBV001A
+
+
+# Import HBV model
+HBV001A = import_hbv_model()
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+
+BEST_PARAMS = np.array([
+    0.000000, -0.006586, 0.516617, 0.048269, 60.211472, 582.229789,
+    120.430720, 2.267393, 2.800012, 1.157213, 0.967106, 0.193777,
+    156.938341, 0.211724, 0.000059, 0.000796, 0.009040, 0.000034
+], dtype=np.float32)
+
+PARAM_NAMES = [
+    "snw_dth", "snw_att", "snw_pmf", "snw_amf", "sl0_dth", "sl0_pwp",
+    "sl0_fcy", "sl0_bt0", "urr_dth", "lrr_dth", "urr_wsr", "urr_ulc",
+    "urr_tdh", "urr_tdr", "urr_ndr", "urr_uct", "lrr_dre", "lrr_lct"
+]
+
+PARAM_BOUNDS = [
+    [0.0, 1e-3], [-2.0, 3.0], [0.0, 3.0], [0.0, 10.0],
+    [0.0, 100.0], [5.0, 700.0], [100.0, 700.0], [0.01, 10.0],
+    [0.0, 20.0], [0.0, 100.0], [0.0, 1.0], [0.0, 1.0],
+    [0.0, 200.0], [0.01, 1.0], [0.0, 1.0], [0.0, 1.0],
+    [0.0, 1.0], [0.0, 1.0]
+]
+
+# =============================================================================
+# FAST HBV MODEL
+# =============================================================================
+
+class FastHBVModel:
+    def __init__(self, data_dir: str):
+        self.data_dir = Path(data_dir)
+        self.load_data()
+        
+        self.model = HBV001A()
+        self.model.set_inputs(self.tems, self.ppts_orig, self.pets)
+        self.model.set_outputs(self.tsps)
+        self.model.set_discharge_scaler(self.dslr)
+        self.model.set_optimization_flag(0)
+        
+        self.warmup = 150
+        self.q_obs_warmup = self.diso[self.warmup:]
+        self.q_obs_mean = float(np.mean(self.q_obs_warmup))
+        self.denominator = float(np.sum((self.q_obs_warmup - self.q_obs_mean) ** 2))
+    
+    def load_data(self):
+        ts_csv = self.data_dir / "time_series___24163005.csv"
+        ar_csv = self.data_dir / "area___24163005.csv"
+        
+        df = pd.read_csv(ts_csv, sep=";", index_col=0)
+        self.tems = df["tavg__ref"].values.astype(np.float32)
+        self.ppts_orig = df["pptn__ref"].values.astype(np.float32)
+        self.pets = df["petn__ref"].values.astype(np.float32)
+        self.diso = df["diso__ref"].values.astype(np.float32)
+        self.tsps = len(self.tems)
+        
+        cca_df = pd.read_csv(ar_csv, sep=";", index_col=0)
+        ccaa = float(cca_df.values[0, 0])
+        self.dslr = ccaa / (3600.0 * 1000.0)
+    
+    def run_model(self, ppt, params):
+        self.model.set_inputs(self.tems, ppt, self.pets)
+        self.model.set_parameters(np.asarray(params, dtype=np.float32))
+        self.model.run_model()
+        return self.model.get_discharge()
+    
+    def nse_raw(self, q_sim):
+        q_sim_w = q_sim[self.warmup:]
+        if not np.all(np.isfinite(q_sim_w)): return -999.0
+        valid = np.isfinite(q_sim_w)
+        if int(np.sum(valid)) < 100: return -999.0
+        
+        q_s = q_sim_w[valid]
+        q_o = self.q_obs_warmup[valid]
+        num = float(np.sum((q_o - q_s) ** 2))
+        if self.denominator <= 0: return -999.0
+        return 1.0 - num / self.denominator
+    
+    def objective(self, ppt, params):
+        try:
+            q = self.run_model(ppt, params)
+            nse = self.nse_raw(q)
+            if not np.isfinite(nse) or nse <= -900: return 1e6
+            return 1.0 - nse
+        except: return 1e6
+    
+    def calibrate_fast(self, ppt, ref_params):
+        res = minimize(
+            lambda x: self.objective(ppt, x),
+            x0=np.asarray(ref_params, dtype=float),
+            method="L-BFGS-B",
+            bounds=PARAM_BOUNDS,
+            options={"maxiter": 500, "ftol": 1e-9}
+        )
+        best_nse = 1.0 - res.fun if res.fun < 1e5 else -999.0
+        return res.x.astype(np.float32), float(best_nse)
+
+# =============================================================================
+# WORKER
+# =============================================================================
+
+_WORKER = {"hbv": None, "ref": None, "std": None}
+
+def _init_worker(data_dir, ref_params, perturbation_std):
+    _WORKER["hbv"] = FastHBVModel(data_dir)
+    _WORKER["ref"] = np.asarray(ref_params, dtype=np.float32)
+    _WORKER["std"] = perturbation_std
+
+def process_chunk(items):
+    hbv = _WORKER["hbv"]
+    ref = _WORKER["ref"]
+    std = _WORKER["std"]
+    
+    out = []
+    for seed, run_id in items:
+        try:
+            seed = int(seed); run_id = int(run_id)
+            np.random.seed(seed)
+            
+            # Perturbation with configurable std
+            C = np.random.normal(1.0, std, len(hbv.ppts_orig)).astype(np.float32)
+            C = np.maximum(C, 0.01)
+            ppt_pert = hbv.ppts_orig * C
+            
+            rel = np.abs(ppt_pert - hbv.ppts_orig) / (hbv.ppts_orig + 1e-10)
+            mean_rel_change = float(np.mean(rel))
+            
+            # Scenario A: Fixed
+            q_fixed = hbv.run_model(ppt_pert, ref)
+            nse_fixed_raw = float(hbv.nse_raw(q_fixed))
+            ofv_fixed = 1.0 - nse_fixed_raw
+            
+            # Scenario B: Recalibrate
+            params_recal, nse_recal_raw = hbv.calibrate_fast(ppt_pert, ref)
+            ofv_recal = 1.0 - nse_recal_raw
+            
+            # Store discharge for plotting
+            q_recal = hbv.run_model(ppt_pert, params_recal)
+            
+            out.append({
+                "run_id": run_id, "seed": seed,
+                "mean_rel_change": mean_rel_change,
+                "nse_fixed_raw": nse_fixed_raw,
+                "nse_recal_raw": nse_recal_raw,
+                "ofv_fixed": ofv_fixed,
+                "ofv_recal": ofv_recal,
+                "params_recal": params_recal,
+                "q_fixed": q_fixed,
+                "q_recal": q_recal,
+                "ppt_pert": ppt_pert,
+                "success": True
+            })
+        except Exception:
+            out.append({
+                "run_id": run_id, "seed": int(seed),
+                "mean_rel_change": 0.0,
+                "nse_fixed_raw": -999.0,
+                "nse_recal_raw": -999.0,
+                "ofv_fixed": 2.0,
+                "ofv_recal": 2.0,
+                "params_recal": ref.copy(),
+                "q_fixed": None,
+                "q_recal": None,
+                "ppt_pert": None,
+                "success": False
+            })
+    return out
+
+# =============================================================================
+# COMPLETE ANALYSIS
+# =============================================================================
+
+class CompleteAnalysis:
+    def __init__(self, data_dir, ref_params, n_runs, perturbation_std=0.05):
+        self.data_dir = str(data_dir)
+        self.ref_params = np.asarray(ref_params, dtype=np.float32)
+        self.n_runs = int(n_runs)
+        self.perturbation_std = perturbation_std
+        
+        self.hbv = FastHBVModel(self.data_dir)
+        q_ref = self.hbv.run_model(self.hbv.ppts_orig, self.ref_params)
+        self.ref_nse_raw = float(self.hbv.nse_raw(q_ref))
+        self.ref_nse = float(np.clip(self.ref_nse_raw, 0.0, 1.0))
+        self.ref_ofv = 1.0 - self.ref_nse_raw
+        self.q_ref = q_ref
+    
+    def run(self, max_workers=2, chunk_size=20):
+        base_seed = 42
+        seeds = [base_seed + i for i in range(self.n_runs)]
+        
+        chunks = []
+        for start in range(0, self.n_runs, chunk_size):
+            end = min(start + chunk_size, self.n_runs)
+            items = [(seeds[i], i) for i in range(start, end)]
+            chunks.append(items)
+        
+        try:
+            ctx = mp.get_context("fork")
+        except:
+            ctx = mp.get_context()
+        
+        t0 = time.time()
+        all_results = []
+        completed = 0
+        
+        with ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=ctx,
+            initializer=_init_worker,
+            initargs=(self.data_dir, self.ref_params, self.perturbation_std)
+        ) as ex:
+            futures = [ex.submit(process_chunk, ch) for ch in chunks]
+            
+            for fut in as_completed(futures):
+                res = fut.result()
+                all_results.extend(res)
+                completed += len(res)
+                
+                elapsed = time.time() - t0
+                rate = completed / elapsed if elapsed > 0 else 0.0
+                rem = self.n_runs - completed
+                eta = rem / rate if rate > 0 else 0
+                print(f" {completed}/{self.n_runs} | {rate:.2f}/s | ETA: {eta/60:.1f}min")
+                gc.collect()
+        
+        self.results = all_results
+        self.valid = [r for r in all_results if r["success"]]
+        
+        if not self.valid:
+            print("\n No valid results!")
+            return False
+        
+        self.input_changes = np.array([r["mean_rel_change"] for r in self.valid])
+        self.nse_fixed_raw = np.array([r["nse_fixed_raw"] for r in self.valid])
+        self.nse_recal_raw = np.array([r["nse_recal_raw"] for r in self.valid])
+        self.ofv_fixed = np.array([r["ofv_fixed"] for r in self.valid])
+        self.ofv_recal = np.array([r["ofv_recal"] for r in self.valid])
+        
+        self.nse_fixed = np.clip(self.nse_fixed_raw, 0.0, 1.0)
+        self.nse_recal = np.clip(self.nse_recal_raw, 0.0, 1.0)
+        
+        self.params_recal = np.array([r["params_recal"] for r in self.valid], dtype=np.float32)
+        
+        self._calc_stats()
+        return True
+    
+    def _calc_stats(self):
+        self.mean_input_change = float(np.mean(self.input_changes) * 100)
+        self.std_input_change = float(np.std(self.input_changes) * 100)
+        
+        self.mean_nse_fixed = float(np.mean(self.nse_fixed))
+        self.std_nse_fixed = float(np.std(self.nse_fixed))
+        self.mean_nse_recal = float(np.mean(self.nse_recal))
+        self.std_nse_recal = float(np.std(self.nse_recal))
+        
+        self.improvement = self.nse_recal - self.nse_fixed
+        self.mean_improvement = float(np.mean(self.improvement))
+        self.pct_improved = float(np.mean(self.improvement > 0) * 100)
+        
+        # Compensation
+        loss_fixed = self.ref_nse - self.mean_nse_fixed
+        loss_recal = self.ref_nse - self.mean_nse_recal
+        if loss_fixed < 1e-3:
+            self.compensation = np.nan
+        else:
+            self.compensation = float((1 - loss_recal / loss_fixed) * 100)
+        
+        self.param_means = np.mean(self.params_recal, axis=0)
+        self.param_stds = np.std(self.params_recal, axis=0)
+        self.param_cvs = self.param_stds / (np.abs(self.param_means) + 1e-10) * 100
+    
+    def print_answers(self):
+        n = len(self.nse_fixed)
+        print("\n" + "="*70)
+        print("ASSIGNMENT 4 - COMPLETE ANSWERS")
+        print("="*70)
+        print(f"\nPerturbation: N(1, {self.perturbation_std}) → ~{self.perturbation_std*200:.0f}% range")
+        print(f"Reference NSE: {self.ref_nse:.4f}")
+        print(f"Valid runs: {n}/{self.n_runs}")
+        
+        print(f"\n❓ Q1: How often did results get BETTER by chance?")
+        better_fixed = np.sum(self.nse_fixed > self.ref_nse)
+        better_recal = np.sum(self.nse_recal > self.ref_nse)
+        improved = int(np.sum(self.improvement > 0))
+        print(f"   • Fixed better than ref: {better_fixed}/{n} ({better_fixed/n*100:.1f}%)")
+        print(f"   • Recalibrated better than ref: {better_recal}/{n} ({better_recal/n*100:.1f}%)")
+        print(f"   • Recalibration improved: {improved}/{n} ({self.pct_improved:.1f}%)")
+        
+        print(f"\n❓ Q2: How much can recalibration compensate?")
+        print(f"   • Mean degradation (fixed): {self.ref_nse - self.mean_nse_fixed:.4f}")
+        print(f"   • Mean degradation (recal): {self.ref_nse - self.mean_nse_recal:.4f}")
+        if np.isfinite(self.compensation):
+            print(f"   • Compensation: {self.compensation:.1f}%")
+        
+        print(f"\n❓ Q3: Should we use input uncertainty during calibration?")
+        if np.isfinite(self.compensation) and self.compensation < 80:
+            print(f"   → YES! Only {self.compensation:.1f}% compensated")
+        elif np.isfinite(self.compensation):
+            print(f"   → MODERATE: {self.compensation:.1f}% compensated")
+        print("="*70)
+
+# =============================================================================
+# ALL PLOTS
+# =============================================================================
+
+def create_all_plots(A, out_dir="assignment4_complete"):
+    os.makedirs(out_dir, exist_ok=True)
+    plt.style.use("seaborn-v0_8-paper")
+    
+    print("\n Generating ALL plots...")
+    
+# PLOT 1: CDF of Precipitation (Verification) - FIXED
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+# Original precipitation
+    sorted_orig = np.sort(A.hbv.ppts_orig)
+    p_orig = np.arange(1, len(sorted_orig)+1) / len(sorted_orig)
+    ax.plot(sorted_orig, p_orig, 'k-', linewidth=3, 
+        label='Original PPT', zorder=100)
+
+# Plot 200 perturbed series 
+    n_to_show = min(200, len(A.valid))
+    for i in range(n_to_show):
+       ppt_pert = A.valid[i]["ppt_pert"]
+       sorted_pert = np.sort(ppt_pert)
+       p_pert = np.arange(1, len(sorted_pert)+1) / len(sorted_pert)
+       ax.plot(sorted_pert, p_pert, 'b-', alpha=0.06, linewidth=0.7)
+    #  alpha=0.06 makes lines transparent so you can see overlap
+
+# Dummy line for legend
+    ax.plot([], [], 'b-', alpha=0.4, linewidth=2, 
+        label=f'Perturbed PPT (n={n_to_show})')
+
+    ax.set_xlabel("Precipitation [mm]", fontweight='bold')
+    ax.set_ylabel("Cumulative Probability", fontweight='bold')
+    ax.set_title("CDF of Precipitation - Verification", fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/1_cdf_precipitation.png", dpi=200)
+    plt.close()
+    
+    # PLOT 2: CDF of OFVs
+    print("  2/7: OFV CDFs...")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sorted_fixed = np.sort(A.ofv_fixed)
+    p_fixed = np.arange(1, len(sorted_fixed)+1) / len(sorted_fixed)
+    sorted_recal = np.sort(A.ofv_recal)
+    p_recal = np.arange(1, len(sorted_recal)+1) / len(sorted_recal)
+    
+    ax.plot(sorted_fixed, p_fixed, 'o-', markersize=3, label='Reference Precipitation (Fixed Params)', linewidth=2)
+    ax.plot(sorted_recal, p_recal, 's--', markersize=3, label='Perturbed Precipitation (Recalibrated)', linewidth=2)
+    ax.axvline(A.ref_ofv, color='green', linestyle=':', linewidth=2, label=f'Ref OFV = {A.ref_ofv:.4f}')
+    
+    ax.set_xlabel("Objective Function Value (1 - NSE)", fontweight='bold')
+    ax.set_ylabel("Cumulative Probability", fontweight='bold')
+    ax.set_title("CDF of Objective Function Values", fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/2_cdf_ofvs.png", dpi=200)
+    plt.close()
+    
+    # PLOT 3: CDF of Parameters (18 panels)
+    print("  3/7: Parameter CDFs (18 panels)...")
+    fig, axs = plt.subplots(18, 1, figsize=(8, 54))
+    for i, name in enumerate(PARAM_NAMES):
+        # Reference params (just one value, so plot as vertical line concept)
+        ref_val = BEST_PARAMS[i]
+        
+        # Recalibrated params
+        sorted_recal = np.sort(A.params_recal[:, i])
+        p_recal = np.arange(1, len(sorted_recal)+1) / len(sorted_recal)
+        
+        axs[i].axvline(ref_val, color='red', linestyle='-', linewidth=3, 
+                      label='Reference Parameter', zorder=10)
+        axs[i].plot(sorted_recal, p_recal, 's--', markersize=2, 
+                   label='Perturbed Precipitation (Recalibrated)', linewidth=2)
+        axs[i].set_xlabel(f"Parameter: {name}", fontweight='bold')
+        axs[i].set_ylabel("Cumulative Probability", fontweight='bold')
+        axs[i].set_title(f"CDF of {name}", fontweight='bold')
+        axs[i].legend(fontsize=8)
+        axs[i].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/3_cdf_parameters_all.png", dpi=200)
+    plt.close()
+    
+    # PLOT 4: Scatter OFVs (1:1 line)
+    print("  4/7: OFV Scatter...")
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(A.ofv_recal, A.ofv_fixed, alpha=0.7, s=40)
+    
+    min_val = min(A.ofv_recal.min(), A.ofv_fixed.min())
+    max_val = max(A.ofv_recal.max(), A.ofv_fixed.max())
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', 
+           label='1:1 line (angle bisector)', linewidth=2)
+    
+    ax.set_xlabel("OFV when recalibrating after perturbation", fontweight='bold')
+    ax.set_ylabel("OFV when using parameters from assignment 1", fontweight='bold')
+    ax.set_title("Scatterplot of OFVs", fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/4_scatter_ofvs.png", dpi=200)
+    plt.close()
+    
+    # PLOT 5: Scatter relative change vs NSE
+    print("  5/7: Relative Change vs NSE...")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    input_pct = A.input_changes * 100
+    ax.scatter(input_pct, A.nse_fixed, s=40, alpha=0.6, color='red', label='Fixed')
+    ax.scatter(input_pct, A.nse_recal, s=40, alpha=0.6, color='blue', label='Recalibrated')
+    ax.axhline(A.ref_nse, ls=":", lw=2, color='green', label='Reference NSE')
+    ax.set_xlabel("Mean Absolute Relative PPT Change (%)", fontweight='bold')
+    ax.set_ylabel("NSE", fontweight='bold')
+    ax.set_title("Scatter: Relative Change vs NSE", fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/5_scatter_relative_change.png", dpi=200)
+    plt.close()
+    
+    # PLOT 6: Boxplots of each parameter (18 individual files)
+    print("  6/7: Parameter Boxplots (18 files)...")
+    for j, name in enumerate(PARAM_NAMES):
+        fig, ax = plt.subplots(figsize=(6, 5))
+        param_vals = A.params_recal[:, j]
+        ax.boxplot([param_vals], labels=[name], showfliers=False)
+        ax.scatter(1, BEST_PARAMS[j], color='red', s=100, 
+                  label='Reference Parameter', zorder=5)
+        ax.set_xlabel("Parameter", fontweight='bold')
+        ax.set_ylabel("Parameter Value", fontweight='bold')
+        ax.set_title(f"Boxplot of Parameter: {name}", fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+        plt.tight_layout()
+        plt.savefig(f"{out_dir}/6_boxplot_{name}.png", dpi=200)
+        plt.close()
+    
+    # PLOT 7: Hydrograph (first 5 simulations)
+    print("  7/7: Hydrograph...")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    time_index = np.arange(len(A.hbv.diso))
+    
+    ax.plot(time_index, A.hbv.diso, label="Observed Discharge", 
+           linewidth=3, color='black', zorder=10)
+    
+    # Plot first 5 recalibrated simulations
+    for j in range(min(5, len(A.valid))):
+        q_sim = A.valid[j]["q_recal"]
+        ax.plot(time_index, q_sim, label=f"Simulated {j+1}", alpha=0.6, linewidth=1)
+    
+    ax.set_xlabel("Time [timestep]", fontweight='bold')
+    ax.set_ylabel("Discharge [m³/s]", fontweight='bold')
+    ax.set_title("Simulated vs Observed Discharge (First 5 Recalibrated)", fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/7_hydrograph.png", dpi=200)
+    plt.close()
+    
+    print(f"\n All plots saved to {out_dir}/")
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    print("\n" + "="*70)
+    print(" ASSIGNMENT 4: ABSOLUTELY COMPLETE VERSION")
+    print("="*70)
+    print("\nALL PLOTS FROM CODE SNIPPET:")
+    print("   CDF of precipitation")
+    print("   CDF of OFVs")
+    print("   CDF of parameters (18 panels)")
+    print("   Scatter OFVs (1:1 line)")
+    print("   Scatter relative change vs NSE")
+    print("   Boxplots (18 individual files)")
+    print("   Hydrograph (simulated vs observed)")
+    print("="*70)
+    
+    data_dir = "/Users/nafisaraihana/Downloads/24163005"
+    if not Path(data_dir).exists():
+        print(f"\n ERROR: {data_dir} not found")
+        return
+    
+    print("\nChoose perturbation level:")
+    print("1. Standard (5% - N(1, 0.05))")
+    print("2. Large (25% range - N(1, 0.125))")
+    pert_choice = input("Perturbation (1/2): ").strip()
+    pert_std = 0.05 if pert_choice == "1" else 0.125
+    
+    print("\nHow many runs?")
+    print("1. Test (20 runs ~ 2 min)")
+    print("2. Small (100 runs ~ 10 min)")
+    print("3. Assignment (200 runs ~ 20 min)")
+    print("4. Full (2000 runs ~ 3 hours)")
+    
+    choice = input("\nChoice (1-4): ").strip()
+    n_runs = {"1": 20, "2": 100, "3": 200, "4": 2000}.get(choice, 200)
+    
+    print(f"\n⚡ Configuration:")
+    print(f"   Runs: {n_runs}")
+    print(f"   Perturbation: N(1, {pert_std})")
+    print(f"   Workers: 2\n")
+    
+    A = CompleteAnalysis(data_dir, BEST_PARAMS, n_runs, pert_std)
+    print(f"Reference NSE: {A.ref_nse:.4f}")
+    print(f"Reference OFV: {A.ref_ofv:.4f}\n")
+    
+    t0 = time.time()
+    success = A.run(max_workers=2, chunk_size=20)
+    
+    if not success:
+        return
+    
+    runtime = (time.time() - t0) / 60
+    print(f"\n  Runtime: {runtime:.1f} minutes")
+    
+    # Generate ALL plots
+    create_all_plots(A, "assignment4_complete")
+    
+    # Print answers
+    A.print_answers()
+    
+    # Save CSV
+    df = pd.DataFrame({
+        "seed": [r["seed"] for r in A.valid],
+        "input_change_pct": A.input_changes * 100,
+        "nse_fixed": A.nse_fixed,
+        "nse_recalibrated": A.nse_recal,
+        "ofv_fixed": A.ofv_fixed,
+        "ofv_recalibrated": A.ofv_recal,
+    })
+    for i, name in enumerate(PARAM_NAMES):
+        df[f"recal_{name}"] = A.params_recal[:, i]
+        df[f"ref_{name}"] = BEST_PARAMS[i]
+    
+    df.to_csv("assignment4_results_COMPLETE.csv", index=False)
+    print(f"\n Saved: assignment4_results_COMPLETE.csv")
+    
+    print("\n" + "="*70)
+    print("ABSOLUTELY COMPLETE!")
+    print("="*70)
+    print(f"\nGenerated:")
+    print(f"   7 plot types in: assignment4_complete/")
+    print(f"      1_cdf_precipitation.png")
+    print(f"      2_cdf_ofvs.png")
+    print(f"      3_cdf_parameters_all.png (18 panels)")
+    print(f"      4_scatter_ofvs.png")
+    print(f"      5_scatter_relative_change.png")
+    print(f"      6_boxplot_[param].png (18 files)")
+    print(f"      7_hydrograph.png")
+    print(f"   assignment4_results_COMPLETE.csv")
+    print("="*70)
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    start = time.time()
+    main()
+    print(f"\n  Total: {(time.time()-start)/60:.1f} minutes\n")
